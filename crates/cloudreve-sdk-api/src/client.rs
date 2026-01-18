@@ -1,9 +1,11 @@
 use crate::error::{ApiError, ApiResponse, ApiResult, ErrorCode, LockConflictDetail};
 use crate::models::user::{RefreshTokenRequest, Token};
+use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
 use reqwest::{Client as HttpClient, Method};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::f32::consts::E;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
