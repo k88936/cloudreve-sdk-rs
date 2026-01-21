@@ -127,6 +127,10 @@ impl RequestOptions {
 pub type OnCredentialRefreshed =
     Arc<dyn Fn(Token) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Callback type for credential invalid/expired events (401, 40020, 40089)
+pub type OnCredentialInvalid =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// Main Cloudreve API client
 pub struct Client {
     pub(crate) config: ClientConfig,
@@ -134,6 +138,7 @@ pub struct Client {
     pub(crate) tokens: Arc<RwLock<TokenStore>>,
     pub(crate) purchase_ticket: Arc<RwLock<Option<String>>>,
     on_credential_refreshed: Option<OnCredentialRefreshed>,
+    on_credential_invalid: Option<OnCredentialInvalid>,
 }
 
 impl Client {
@@ -150,6 +155,7 @@ impl Client {
             tokens: Arc::new(RwLock::new(TokenStore::new())),
             purchase_ticket: Arc::new(RwLock::new(None)),
             on_credential_refreshed: None,
+            on_credential_invalid: None,
         }
     }
 
@@ -178,6 +184,27 @@ impl Client {
     /// Clear the credential refresh callback
     pub fn clear_on_credential_refreshed(&mut self) {
         self.on_credential_refreshed = None;
+    }
+
+    /// Set a callback to be invoked when credentials are invalid or expired
+    ///
+    /// This callback is triggered when the API returns error codes indicating
+    /// authentication failure: 401 (LoginRequired), 40020 (CredentialInvalid),
+    /// or 40089 (SessionExpired).
+    pub fn set_on_credential_invalid(&mut self, callback: OnCredentialInvalid) {
+        self.on_credential_invalid = Some(callback);
+    }
+
+    /// Clear the credential invalid callback
+    pub fn clear_on_credential_invalid(&mut self) {
+        self.on_credential_invalid = None;
+    }
+
+    /// Invoke the credential invalid callback if set
+    async fn notify_credential_invalid(&self) {
+        if let Some(ref callback) = self.on_credential_invalid {
+            callback().await;
+        }
     }
 
     /// Set authentication tokens
@@ -229,11 +256,13 @@ impl Client {
 
         // Check if we have tokens
         if !store.has_tokens() {
+            self.notify_credential_invalid().await;
             return Err(ApiError::NoTokensAvailable);
         }
 
         // Check if refresh token is expired
         if store.is_refresh_token_expired() {
+            self.notify_credential_invalid().await;
             return Err(ApiError::RefreshTokenExpired);
         }
 
@@ -267,6 +296,11 @@ impl Client {
         let api_response: ApiResponse<Token> = response.json().await?;
 
         if api_response.code != ErrorCode::Success as i32 {
+            if let Some(error_code) = ErrorCode::from_code(api_response.code) {
+                if error_code.is_credential_error() {
+                    self.notify_credential_invalid().await;
+                }
+            }
             return Err(ApiError::from_response(api_response));
         }
 
@@ -362,6 +396,12 @@ impl Client {
 
         // Check response code
         if api_response.code != ErrorCode::Success as i32 {
+            // Check if this is a credential error and invoke callback
+            if let Some(error_code) = ErrorCode::from_code(api_response.code) {
+                if error_code.is_credential_error() {
+                    self.notify_credential_invalid().await;
+                }
+            }
             return Err(ApiError::from_response(api_response));
         }
 

@@ -49,6 +49,7 @@ pub enum ErrorCode {
     BatchOperationNotFullyCompleted = 40081,
     DomainNotLicensed = 40087,
     AnonymousAccessDenied = 40088,
+    SessionExpired = 40089,
     PurchaseRequired = 40083,
     LoginRequired = 401,
     PermissionDenied = 403,
@@ -67,12 +68,21 @@ impl ErrorCode {
             40081 => Some(Self::BatchOperationNotFullyCompleted),
             40087 => Some(Self::DomainNotLicensed),
             40088 => Some(Self::AnonymousAccessDenied),
+            40089 => Some(Self::SessionExpired),
             40083 => Some(Self::PurchaseRequired),
             401 => Some(Self::LoginRequired),
             403 => Some(Self::PermissionDenied),
             404 => Some(Self::NotFound),
             _ => None,
         }
+    }
+
+    /// Check if this error code indicates an authentication/credential issue
+    pub fn is_credential_error(&self) -> bool {
+        matches!(
+            self,
+            Self::CredentialInvalid | Self::LoginRequired | Self::SessionExpired
+        )
     }
 }
 
@@ -164,9 +174,9 @@ impl ApiError {
                     aggregated_errors: aggregated,
                 }
             }
-            Some(ErrorCode::LoginRequired) | Some(ErrorCode::CredentialInvalid) => {
-                ApiError::LoginRequired(response.msg)
-            }
+            Some(ErrorCode::LoginRequired)
+            | Some(ErrorCode::CredentialInvalid)
+            | Some(ErrorCode::SessionExpired) => ApiError::LoginRequired(response.msg),
             _ => ApiError::ApiError {
                 code,
                 message: response.msg,
