@@ -16,7 +16,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::fs::File;
@@ -219,7 +219,8 @@ impl Stream for ChunkStream {
 pub struct ProgressStream<S> {
     inner: S,
     tracker: Arc<ProgressTracker>,
-    bytes_sent_this_chunk: u64,
+    /// Shared counter for bytes sent, accessible after stream is consumed
+    bytes_sent_counter: Arc<AtomicU64>,
 }
 
 impl<S> ProgressStream<S> {
@@ -228,14 +229,13 @@ impl<S> ProgressStream<S> {
         Self {
             inner,
             tracker,
-            bytes_sent_this_chunk: 0,
+            bytes_sent_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Get bytes sent in this chunk stream
-    #[allow(dead_code)]
-    pub fn bytes_sent(&self) -> u64 {
-        self.bytes_sent_this_chunk
+    /// Get a handle to the bytes sent counter that remains valid after stream is consumed
+    pub fn bytes_sent_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.bytes_sent_counter)
     }
 }
 
@@ -249,7 +249,7 @@ where
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
                 let len = bytes.len() as u64;
-                self.bytes_sent_this_chunk += len;
+                self.bytes_sent_counter.fetch_add(len, Ordering::SeqCst);
                 self.tracker.add_bytes(len);
                 Poll::Ready(Some(Ok(bytes)))
             }
@@ -724,6 +724,8 @@ async fn upload_chunk_with_retry(
 
         // Wrap with progress tracking
         let progress_stream = ProgressStream::new(inner_stream, Arc::clone(tracker));
+        // Capture bytes counter before stream is consumed
+        let bytes_sent_counter = progress_stream.bytes_sent_counter();
 
         match providers::upload_chunk_with_progress(
             http_client,
@@ -745,6 +747,9 @@ async fn upload_chunk_with_retry(
                 return Ok(etag);
             }
             Err(e) => {
+                // Use the captured counter to get bytes sent after stream was consumed
+                let bytes_sent = bytes_sent_counter.load(Ordering::SeqCst);
+                tracker.reset_chunk_bytes(bytes_sent);
                 if attempt == config.max_retries {
                     error!(
                         target: "uploader::chunk",
