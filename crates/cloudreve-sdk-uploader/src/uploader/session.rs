@@ -5,22 +5,6 @@ use crate::uploader::providers::PolicyType;
 use chrono::Utc;
 use cloudreve_api::models::explorer::{EncryptMetadata, UploadCredential};
 use serde::{Deserialize, Serialize};
-
-/// Configuration for creating an upload session
-#[derive(Debug, Clone)]
-pub struct UploadSessionConfig {
-    /// Storage policy ID
-    pub policy_id: String,
-    /// File size in bytes
-    pub file_size: u64,
-    /// File MIME type
-    pub mime_type: Option<String>,
-    /// Last modified timestamp
-    pub last_modified: Option<i64>,
-    /// Whether to create a new version (overwrite)
-    pub overwrite: bool,
-}
-
 /// Persisted upload session state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadSession {
