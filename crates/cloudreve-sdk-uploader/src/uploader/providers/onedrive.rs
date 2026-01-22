@@ -16,6 +16,7 @@ use tracing::{debug, warn};
 /// OneDrive chunk upload response
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct OneDriveChunkResponse {
     #[serde(default)]
     expiration_date_time: Option<String>,
@@ -37,6 +38,7 @@ struct OneDriveErrorDetails {
     #[serde(default)]
     innererror: Option<OneDriveInnerError>,
     #[serde(default)]
+    #[allow(dead_code)]
     retry_after_seconds: Option<u32>,
 }
 
@@ -126,6 +128,7 @@ where
 }
 
 /// Query OneDrive session status to get next expected range
+#[allow(dead_code)]
 pub async fn query_session_status(
     http_client: &HttpClient,
     session: &UploadSession,

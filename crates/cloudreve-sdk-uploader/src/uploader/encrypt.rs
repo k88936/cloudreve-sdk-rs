@@ -4,11 +4,8 @@ use crate::uploader::error::{UploadError, UploadResult};
 use aes::Aes256;
 use aes::cipher::{KeyIvInit, StreamCipher};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use bytes::{Bytes, BytesMut};
 use cloudreve_api::models::explorer::EncryptMetadata;
 use ctr::Ctr128BE;
-use std::io::{Read, Seek, SeekFrom};
-use tokio::io::{AsyncRead, AsyncReadExt};
 
 type Aes256Ctr = Ctr128BE<Aes256>;
 
@@ -106,99 +103,5 @@ impl EncryptionConfig {
             // Block-aligned, can encrypt directly
             cipher.apply_keystream(data);
         }
-    }
-
-    /// Encrypt data and return new encrypted bytes
-    pub fn encrypt(&self, data: &[u8], byte_offset: u64) -> Bytes {
-        let mut encrypted = BytesMut::from(data);
-        self.encrypt_at_offset(&mut encrypted, byte_offset);
-        encrypted.freeze()
-    }
-}
-
-/// Encrypted reader that encrypts data on the fly
-pub struct EncryptedReader<R> {
-    inner: R,
-    config: EncryptionConfig,
-    position: u64,
-}
-
-impl<R> EncryptedReader<R> {
-    /// Create a new encrypted reader
-    pub fn new(reader: R, config: EncryptionConfig) -> Self {
-        Self {
-            inner: reader,
-            config,
-            position: 0,
-        }
-    }
-
-    /// Create an encrypted reader starting at a specific offset
-    pub fn with_offset(reader: R, config: EncryptionConfig, offset: u64) -> Self {
-        Self {
-            inner: reader,
-            config,
-            position: offset,
-        }
-    }
-}
-
-impl<R: Read> Read for EncryptedReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let bytes_read = self.inner.read(buf)?;
-        if bytes_read > 0 {
-            self.config
-                .encrypt_at_offset(&mut buf[..bytes_read], self.position);
-            self.position += bytes_read as u64;
-        }
-        Ok(bytes_read)
-    }
-}
-
-impl<R: Seek> Seek for EncryptedReader<R> {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        let new_pos = self.inner.seek(pos)?;
-        self.position = new_pos;
-        Ok(new_pos)
-    }
-}
-
-/// Read a chunk from an async reader and optionally encrypt it
-pub async fn read_and_encrypt_chunk<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    buffer: &mut [u8],
-    encryption: Option<&EncryptionConfig>,
-    byte_offset: u64,
-) -> std::io::Result<usize> {
-    let bytes_read = reader.read(buffer).await?;
-
-    if bytes_read > 0 {
-        if let Some(config) = encryption {
-            config.encrypt_at_offset(&mut buffer[..bytes_read], byte_offset);
-        }
-    }
-
-    Ok(bytes_read)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_increment_counter() {
-        let mut counter = [0u8; 16];
-        counter[15] = 0xFF;
-        EncryptionConfig::increment_counter(&mut counter, 1);
-        assert_eq!(counter[14], 1);
-        assert_eq!(counter[15], 0);
-    }
-
-    #[test]
-    fn test_increment_counter_large() {
-        let mut counter = [0u8; 16];
-        EncryptionConfig::increment_counter(&mut counter, 256);
-        assert_eq!(counter[14], 1);
-        assert_eq!(counter[15], 0);
     }
 }

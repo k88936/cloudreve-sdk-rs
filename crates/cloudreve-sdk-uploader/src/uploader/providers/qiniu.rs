@@ -15,6 +15,7 @@ use tracing::debug;
 struct QiniuChunkResponse {
     etag: String,
     #[serde(default)]
+    #[allow(dead_code)]
     md5: String,
 }
 
