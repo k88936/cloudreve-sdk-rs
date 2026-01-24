@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Logged in as: {}", login_response.user.nickname);
 
     // Set tokens for subsequent requests
-    client.set_tokens_with_expiry(&login_response.token).await;
+    client.set_tokens_with_expiry(&login_response.token).await?;
 
     // Use the API - tokens will be automatically refreshed if needed
     let user = client.get_user_me().await?;
@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 let login_response = client.login("user@example.com", "password").await?;
-client.set_tokens_with_expiry(&login_response.token).await;
+client.set_tokens_with_expiry(&login_response.token).await?;
 ```
 
 ### Two-Factor Authentication
@@ -88,10 +88,10 @@ match client.login("user@example.com", "password").await {
         let otp = "123456";
         let session_id = "..."; // Extract from error
         let login_response = client.login_2fa(otp, session_id).await?;
-        client.set_tokens_with_expiry(&login_response.token).await;
+        client.set_tokens_with_expiry(&login_response.token).await?;
     }
     Ok(response) => {
-        client.set_tokens_with_expiry(&response.token).await;
+        client.set_tokens_with_expiry(&response.token).await?;
     }
     Err(e) => return Err(e.into()),
 }

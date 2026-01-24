@@ -141,6 +141,10 @@ pub enum ApiError {
     #[error("No authentication tokens available")]
     NoTokensAvailable,
 
+    /// Invalid JWT token
+    #[error("Invalid token: {0}")]
+    InvalidToken(String),
+
     /// SSE connection returned non-SSE response (server returned error before upgrading)
     #[error("SSE connection failed (code {code}): {message}")]
     SseNotUpgraded { code: i32, message: String },
