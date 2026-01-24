@@ -1,6 +1,5 @@
 use crate::error::{ApiError, ApiResponse, ApiResult, ErrorCode, LockConflictDetail};
 use crate::models::user::{RefreshTokenRequest, Token};
-use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use reqwest::{Client as HttpClient, Method};
 use serde::de::DeserializeOwned;
