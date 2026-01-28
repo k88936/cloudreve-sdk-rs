@@ -21,6 +21,8 @@ pub struct ClientConfig {
     pub timeout_seconds: u64,
     /// Client ID
     pub client_id: String,
+    /// User agent string for HTTP requests
+    pub user_agent: Option<String>,
 }
 
 impl ClientConfig {
@@ -30,6 +32,7 @@ impl ClientConfig {
             base_url: base_url.into(),
             timeout_seconds: 60,
             client_id: "".to_string(),
+            user_agent: None,
         }
     }
 
@@ -42,6 +45,12 @@ impl ClientConfig {
     /// Set the client ID
     pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
         self.client_id = client_id.into();
+        self
+    }
+
+    /// Set the user agent string
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = Some(user_agent.into());
         self
     }
 }
@@ -142,10 +151,14 @@ pub struct Client {
 impl Client {
     /// Create a new API client
     pub fn new(config: ClientConfig) -> Self {
-        let http_client = HttpClient::builder()
-            .connect_timeout(std::time::Duration::from_secs(config.timeout_seconds))
-            .build()
-            .expect("Failed to create HTTP client");
+        let mut builder = HttpClient::builder()
+            .connect_timeout(std::time::Duration::from_secs(config.timeout_seconds));
+
+        if let Some(ref user_agent) = config.user_agent {
+            builder = builder.user_agent(user_agent);
+        }
+
+        let http_client = builder.build().expect("Failed to create HTTP client");
 
         Self {
             config,
