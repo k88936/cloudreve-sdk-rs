@@ -65,12 +65,23 @@ pub enum ShareLinksInProfileLevel {
 }
 
 /// Authentication token
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Token {
     pub access_token: String,
     pub refresh_token: String,
     pub access_expires: String,
     pub refresh_expires: String,
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Token")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("access_expires", &self.access_expires)
+            .field("refresh_expires", &self.refresh_expires)
+            .finish()
+    }
 }
 
 /// Login response
