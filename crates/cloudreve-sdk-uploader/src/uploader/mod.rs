@@ -191,32 +191,23 @@ impl Uploader {
                 Ok(())
             }
             Err(e) => {
-                if self.cancel_token.is_cancelled() {
-                    info!(
-                        target: "uploader",
-                        local_path = %params.local_path.display(),
-                        "Upload cancelled"
-                    );
-                    Err(UploadError::Cancelled.into())
-                } else {
-                    error!(
+                error!(
+                    target: "uploader",
+                    local_path = %params.local_path.display(),
+                    error = %e,
+                    "Upload failed"
+                );
+                if let Err(e) = self.delete_remote_session(&session).await {
+                    warn!(
                         target: "uploader",
                         local_path = %params.local_path.display(),
                         error = %e,
-                        "Upload failed"
+                        "Failed to delete remote upload session"
                     );
-                    if let Err(e) = self.delete_remote_session(&session).await {
-                        warn!(
-                            target: "uploader",
-                            local_path = %params.local_path.display(),
-                            error = %e,
-                            "Failed to delete remote upload session"
-                        );
-                    }
-                    // Clean up session from database
-                    self.cleanup_session(&session).await?;
-                    Err(e.into())
                 }
+                // Clean up session from database
+                self.cleanup_session(&session).await?;
+                Err(e.into())
             }
         }
     }
