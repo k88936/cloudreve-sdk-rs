@@ -27,6 +27,8 @@ pub struct UploadSession {
     policy_type: PolicyType,
     /// Upload credential from Cloudreve
     credential: UploadCredential,
+    // Whether relay upload is enabled
+    relay: bool,
     /// Per-chunk progress
     pub chunk_progress: Vec<ChunkProgress>,
     /// Encryption metadata (if encrypted)
@@ -59,7 +61,8 @@ impl UploadSession {
 
         let now = Utc::now().timestamp();
         let chunk_progress: Vec<ChunkProgress> =
-            (0..num_chunks).map(|i| ChunkProgress::new(i)).collect();
+            (0..num_chunks).map(|i: usize| ChunkProgress::new(i)).collect();
+        let relay = credential.storage_policy.as_ref().and_then(|p| p.relay).unwrap_or(false);
 
         Self {
             id: credential.session_id.clone(),
@@ -76,6 +79,7 @@ impl UploadSession {
             created_at: now,
             updated_at: now,
             credential,
+            relay,
         }
     }
 
@@ -100,6 +104,10 @@ impl UploadSession {
     /// Get the policy type
     pub fn policy_type(&self) -> PolicyType {
         self.policy_type
+    }
+
+    pub fn is_relay(&self) -> bool {
+        self.relay
     }
 
     /// Check if the session has expired
