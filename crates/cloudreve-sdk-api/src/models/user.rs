@@ -118,6 +118,7 @@ pub struct RefreshTokenRequest {
 pub struct Capacity {
     pub total: i64,
     pub used: i64,
+    #[serde(default)]
     pub storage_pack_total: i64,
 }
 
