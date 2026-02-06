@@ -89,6 +89,7 @@ pub struct DirectLink {
     pub id: String,
     pub created_at: String,
     pub url: String,
+    #[serde(default)]
     pub downloaded: i32,
 }
 
@@ -130,10 +131,12 @@ pub struct Share {
     pub permission_setting: Option<PermissionSettingReq>,
     pub url: String,
     pub visited: i32,
+    #[serde(default)]
     pub downloaded: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expired: Option<bool>,
     pub unlocked: bool,
+    #[serde(default)]
     pub password_protected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_type: Option<i32>,
