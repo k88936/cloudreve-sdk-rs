@@ -1,22 +1,24 @@
-//! File uploader module for Cloudreve sync
+//! File uploader implementation for CLI clients.
 //!
 //! This module provides chunked file upload functionality with support for
-//! multiple storage providers, encryption, resumable uploads, and progress tracking.
+//! multiple storage providers, encryption, retries, cancellation, and progress tracking.
 
 mod chunk;
 mod encrypt;
 mod error;
 mod progress;
+#[allow(dead_code)]
 mod providers;
+#[allow(dead_code)]
 mod session;
 
 use anyhow::{Context, Result};
-pub use chunk::{ChunkProgress, ChunkUploader};
+pub(crate) use chunk::ChunkProgress;
+use chunk::ChunkUploader;
 pub use error::{UploadError, UploadResult};
 pub use progress::{ProgressCallback, ProgressUpdate};
-pub use session::UploadSession;
+use session::UploadSession;
 
-use crate::inventory::InventoryDb;
 use cloudreve_api::{Client as CrClient, api::ExplorerApi};
 use reqwest::Client as HttpClient;
 use std::path::PathBuf;
@@ -66,10 +68,6 @@ pub struct UploadParams {
     pub overwrite: bool,
     /// Previous version ETag (optional)
     pub previous_version: String,
-    /// Task ID for linking with task queue
-    pub task_id: String,
-    /// Drive ID
-    pub drive_id: String,
 }
 
 /// Main uploader struct
@@ -78,8 +76,6 @@ pub struct Uploader {
     cr_client: Arc<CrClient>,
     /// HTTP client for direct uploads to storage providers
     http_client: HttpClient,
-    /// Inventory database for persisting session state
-    inventory: Arc<InventoryDb>,
     /// Uploader configuration
     config: UploaderConfig,
     /// Cancellation token for stopping uploads
@@ -88,11 +84,7 @@ pub struct Uploader {
 
 impl Uploader {
     /// Create a new uploader instance
-    pub fn new(
-        cr_client: Arc<CrClient>,
-        inventory: Arc<InventoryDb>,
-        config: UploaderConfig,
-    ) -> Self {
+    pub fn new(cr_client: Arc<CrClient>, config: UploaderConfig) -> Self {
         let http_client = HttpClient::builder()
             .connect_timeout(config.request_timeout)
             .build()
@@ -101,7 +93,6 @@ impl Uploader {
         Self {
             cr_client,
             http_client,
-            inventory,
             config,
             cancel_token: CancellationToken::new(),
         }
@@ -116,11 +107,10 @@ impl Uploader {
     /// Upload a file with progress reporting
     ///
     /// This method handles:
-    /// - Creating or resuming an upload session
+    /// - Creating an upload session
     /// - Splitting the file into chunks
     /// - Uploading chunks with retries
     /// - Reporting progress
-    /// - Persisting state for resumability
     /// - Completing the upload
     pub async fn upload<P: ProgressCallback + 'static>(
         &self,
@@ -135,33 +125,7 @@ impl Uploader {
             "Starting upload"
         );
 
-        // Try to resume existing session or create new one
-        let mut session = match self.get_or_create_session(&params).await? {
-            Some(session) => {
-                info!(
-                    target: "uploader",
-                    session_id = %session.session_id(),
-                    "Found existing upload session, removing it"
-                );
-                if let Err(e) = self.delete_remote_session(&session).await {
-                    warn!(
-                        target: "uploader",
-                        session_id = %session.session_id(),
-                        error = %e,
-                        "Failed to delete remote upload session, will continue with new session"
-                    );
-                }
-                self.cleanup_session(&session).await?;
-                self.create_session(&params).await?
-            }
-            None => {
-                debug!(
-                    target: "uploader",
-                    "No existing session found, creating new one"
-                );
-                self.create_session(&params).await?
-            }
-        };
+        let mut session = self.create_session(&params).await?;
 
         // Create chunk uploader based on policy type
         let chunk_uploader = self.create_chunk_uploader(&session)?;
@@ -181,8 +145,6 @@ impl Uploader {
             Ok(()) => {
                 // Complete the upload
                 self.complete_upload(&session).await?;
-                // Clean up session from database
-                self.cleanup_session(&session).await?;
                 info!(
                     target: "uploader",
                     local_path = %params.local_path.display(),
@@ -205,8 +167,6 @@ impl Uploader {
                         "Failed to delete remote upload session"
                     );
                 }
-                // Clean up session from database
-                self.cleanup_session(&session).await?;
                 Err(e.into())
             }
         }
@@ -224,68 +184,19 @@ impl Uploader {
         self.cancel_token.is_cancelled()
     }
 
-    /// Get or create an upload session
-    async fn get_or_create_session(
-        &self,
-        params: &UploadParams,
-    ) -> UploadResult<Option<UploadSession>> {
-        // Try to load existing session from database
-        match self
-            .inventory
-            .get_upload_session_by_path(&params.local_path.to_string_lossy().to_string())
-        {
-            Ok(Some(session)) => {
-                // Check if session is still valid
-                if session.is_expired() {
-                    info!(
-                        target: "uploader",
-                        task_id = %params.task_id,
-                        "Existing session expired, will create new one"
-                    );
-                    // Delete expired session
-                    let _ = self.inventory.delete_upload_session(&session.id);
-                    Ok(None)
-                } else {
-                    Ok(Some(session))
-                }
-            }
-            Ok(None) => Ok(None),
-            Err(e) => {
-                warn!(
-                    target: "uploader",
-                    task_id = %params.task_id,
-                    error = %e,
-                    "Failed to load existing session, will create new one"
-                );
-                Ok(None)
-            }
-        }
-    }
-
     /// Create a new upload session via Cloudreve API
     async fn create_session(&self, params: &UploadParams) -> Result<UploadSession> {
-        use cloudreve_api::models::explorer::UploadSessionRequest;
-
+        use cloudreve_api::models::explorer::{EncryptionCipher, UploadSessionRequest};
         let request = UploadSessionRequest {
             uri: params.remote_uri.clone(),
             size: params.file_size as i64,
-            policy_id: "".to_string(),
+            policy_id: String::new(),
             last_modified: params.last_modified,
-            previous: if params.previous_version.is_empty() {
-                None
-            } else {
-                Some(params.previous_version.clone())
-            },
-            entity_type: if params.overwrite {
-                Some("version".to_string())
-            } else {
-                None
-            },
+            previous: (!params.previous_version.is_empty()).then(|| params.previous_version.clone()),
+            entity_type: params.overwrite.then(|| "version".to_string()),
             mime_type: params.mime_type.clone(),
             metadata: None,
-            encryption_supported: Some(vec![
-                cloudreve_api::models::explorer::EncryptionCipher::Aes256Ctr,
-            ]),
+            encryption_supported: Some(vec![EncryptionCipher::Aes256Ctr]),
         };
 
         let credential = self
@@ -303,18 +214,13 @@ impl Uploader {
 
         // Create session object
         let session = UploadSession::new(
-            params.task_id.clone(),
-            params.drive_id.clone(),
+            String::new(),
+            String::new(),
             params.local_path.to_string_lossy().to_string(),
             params.remote_uri.clone(),
             params.file_size,
             credential,
         );
-
-        // Persist session to database
-        self.inventory
-            .insert_upload_session(&session)
-            .map_err(|e| UploadError::DatabaseError(e.to_string()))?;
 
         Ok(session)
     }
@@ -348,16 +254,8 @@ impl Uploader {
         providers::complete_upload(&self.http_client, &self.cr_client, session).await
     }
 
-    /// Clean up session from database
-    async fn cleanup_session(&self, session: &UploadSession) -> UploadResult<()> {
-        self.inventory
-            .delete_upload_session(&session.id)
-            .map_err(|e| UploadError::DatabaseError(e.to_string()))?;
-        Ok(())
-    }
-
     /// Delete the remote upload session (cancel on server side)
-    pub async fn delete_remote_session(&self, session: &UploadSession) -> UploadResult<()> {
+    async fn delete_remote_session(&self, session: &UploadSession) -> UploadResult<()> {
         use cloudreve_api::models::explorer::DeleteUploadSessionService;
 
         let request = DeleteUploadSessionService {
