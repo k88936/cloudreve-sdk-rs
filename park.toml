@@ -1,0 +1,16 @@
+schema-version = 1
+
+[source]
+repository = "https://github.com/cloudreve/desktop.git"
+branch = "main"
+
+[projection]
+branch = "park/projection"
+
+[[mappings]]
+source = "crates/cloudreve-api"
+destination = "crates/cloudreve-sdk-api"
+
+[[mappings]]
+source = "crates/cloudreve-sync/src/uploader"
+destination = "crates/cloudreve-sdk-uploader/src/uploader"
