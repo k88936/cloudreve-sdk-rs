@@ -51,7 +51,7 @@ impl UserApi for Client {
         };
         
         self.post(
-            "/session/login",
+            "/session/token",
             &request,
             RequestOptions::new().no_credential(),
         ).await
@@ -64,7 +64,7 @@ impl UserApi for Client {
         };
         
         self.post(
-            "/session/2fa",
+            "/session/token/2fa",
             &request,
             RequestOptions::new().no_credential(),
         ).await
@@ -117,7 +117,7 @@ impl UserApi for Client {
     
     async fn sign_up(&self, request: &SignUpService) -> ApiResult<()> {
         self.post(
-            "/user/register",
+            "/user",
             request,
             RequestOptions::new().no_credential(),
         ).await
