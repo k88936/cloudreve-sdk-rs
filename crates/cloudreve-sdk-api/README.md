@@ -21,15 +21,26 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cloudreve-api = "0.1"
+cloudreve-sdk-api = "0.1"
 tokio = { version = "1.0", features = ["full"] }
 ```
 
 ## Quick Start
 
+Run the included login and file-listing example:
+
+```bash
+export CLOUDREVE_SERVER="https://cloudreve.example"
+export CLOUDREVE_EMAIL="user@example.com"
+export CLOUDREVE_PASSWORD="your-password"
+export CLOUDREVE_URI="cloudreve://my/"
+
+cargo run -p cloudreve-sdk-api --example login_and_list
+```
+
 ```rust
-use cloudreve_api::{Client, ClientConfig};
-use cloudreve_api::api::{UserApi, ExplorerApi};
+use cloudreve_sdk_api::{Client, ClientConfig};
+use cloudreve_sdk_api::api::{UserApi, ExplorerApi};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("User ID: {}", user.id);
 
     // List files
-    let params = cloudreve_api::models::explorer::ListFileService {
+    let params = cloudreve_sdk_api::models::explorer::ListFileService {
         uri: "/".to_string(),
         page: None,
         page_size: Some(50),
@@ -116,7 +127,7 @@ let capacity = client.get_user_capacity().await?; // No error!
 The library provides detailed error types for different scenarios:
 
 ```rust
-use cloudreve_api::error::{ApiError, ErrorCode};
+use cloudreve_sdk_api::error::{ApiError, ErrorCode};
 
 match client.list_files(&params).await {
     Ok(files) => {
@@ -154,7 +165,7 @@ match client.list_files(&params).await {
 ### File Operations
 
 ```rust
-use cloudreve_api::models::explorer::*;
+use cloudreve_sdk_api::models::explorer::*;
 
 // Create a folder
 let create_req = CreateFileService {
@@ -207,8 +218,8 @@ let file_info = client.get_file_info(&info_req).await?;
 ### Task Management
 
 ```rust
-use cloudreve_api::models::workflow::*;
-use cloudreve_api::api::WorkflowApi;
+use cloudreve_sdk_api::models::workflow::*;
+use cloudreve_sdk_api::api::WorkflowApi;
 
 // Create archive task
 let archive_req = ArchiveWorkflowService {
@@ -238,7 +249,7 @@ println!("Task status: {}", task_status.status);
 ### User Management
 
 ```rust
-use cloudreve_api::api::UserApi;
+use cloudreve_sdk_api::api::UserApi;
 
 // Get user info
 let user = client.get_user_me().await?;

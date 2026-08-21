@@ -12,7 +12,8 @@
 //! ## Example
 //!
 //! ```no_run
-//! use cloudreve_api::{Client, ClientConfig};
+//! use cloudreve_sdk_api::{Client, ClientConfig};
+//! use cloudreve_sdk_api::api::user::UserApi;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
