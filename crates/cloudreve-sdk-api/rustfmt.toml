@@ -1,0 +1,3 @@
+# This crate is mirrored from the official Cloudreve repository by Park.
+# Preserve upstream formatting to avoid noisy merge commits.
+disable_all_formatting = true
