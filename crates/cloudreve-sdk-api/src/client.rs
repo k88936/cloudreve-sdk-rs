@@ -233,14 +233,8 @@ impl Client {
         store.refresh_token_expires = Some(refresh_expires);
     }
 
-    /// Set tokens from a Token response with explicit expiration times
-    ///
-    /// This method validates the access token by parsing it as a JWT and checking
-    /// that the `scopes` field exists and is not empty.
+    /// Set tokens from a Token response with explicit expiration times.
     pub async fn set_tokens_with_expiry(&self, token: &Token) -> ApiResult<()> {
-        // Validate the access token
-        Self::validate_jwt_scopes(&token.access_token)?;
-
         let mut store = self.tokens.write().await;
 
         store.access_token = Some(token.access_token.clone());
@@ -255,53 +249,6 @@ impl Client {
         }
 
         Ok(())
-    }
-
-    /// Validate that a JWT token has a non-empty `scopes` field
-    fn validate_jwt_scopes(token: &str) -> ApiResult<()> {
-        // JWT format: header.payload.signature
-        let parts: Vec<&str> = token.split('.').collect();
-        if parts.len() != 3 {
-            return Err(ApiError::InvalidToken("Invalid JWT format".to_string()));
-        }
-
-        // Decode the payload (second part) - JWT uses base64url encoding
-        let payload_b64 = parts[1];
-        let payload_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            payload_b64,
-        )
-        .map_err(|e| ApiError::InvalidToken(format!("Failed to decode JWT payload: {}", e)))?;
-
-        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
-            .map_err(|e| ApiError::InvalidToken(format!("Failed to parse JWT payload: {}", e)))?;
-
-        // Check that scopes field exists and is not empty
-        match payload.get("scopes") {
-            None => Err(ApiError::InvalidToken(
-                "Token missing 'scopes' field".to_string(),
-            )),
-            Some(scopes) => {
-                if let Some(arr) = scopes.as_array() {
-                    if arr.is_empty() {
-                        return Err(ApiError::InvalidToken(
-                            "Token 'scopes' field is empty".to_string(),
-                        ));
-                    }
-                } else if let Some(s) = scopes.as_str() {
-                    if s.is_empty() {
-                        return Err(ApiError::InvalidToken(
-                            "Token 'scopes' field is empty".to_string(),
-                        ));
-                    }
-                } else {
-                    return Err(ApiError::InvalidToken(
-                        "Token 'scopes' field has invalid type".to_string(),
-                    ));
-                }
-                Ok(())
-            }
-        }
     }
 
     /// Clear all authentication tokens
