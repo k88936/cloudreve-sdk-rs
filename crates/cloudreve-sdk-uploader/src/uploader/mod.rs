@@ -21,6 +21,7 @@ use session::UploadSession;
 
 use cloudreve_api::{Client as CrClient, api::ExplorerApi};
 use reqwest::Client as HttpClient;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,6 +69,10 @@ pub struct UploadParams {
     pub overwrite: bool,
     /// Previous version ETag (optional)
     pub previous_version: String,
+    /// Storage policy id; empty lets Cloudreve pick the default policy.
+    pub policy_id: String,
+    /// Metadata written with the upload session (optional).
+    pub metadata: Option<HashMap<String, String>>,
 }
 
 /// Main uploader struct
@@ -190,12 +195,12 @@ impl Uploader {
         let request = UploadSessionRequest {
             uri: params.remote_uri.clone(),
             size: params.file_size as i64,
-            policy_id: String::new(),
+            policy_id: params.policy_id.clone(),
             last_modified: params.last_modified,
             previous: (!params.previous_version.is_empty()).then(|| params.previous_version.clone()),
             entity_type: params.overwrite.then(|| "version".to_string()),
             mime_type: params.mime_type.clone(),
-            metadata: None,
+            metadata: params.metadata.clone(),
             encryption_supported: Some(vec![EncryptionCipher::Aes256Ctr]),
         };
 

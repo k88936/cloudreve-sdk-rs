@@ -56,7 +56,7 @@ fn decode_time_flow_string_time(str: &str, time_now: i64) -> ApiResult<String> {
     let mut res: Vec<char> = chars.clone();
     let mut secret: Vec<char> = chars.clone();
 
-    let mut add = secret.len() % 2 == 0;
+    let mut add = secret.len().is_multiple_of(2);
     let mut time_digit_index = ((secret.len() - 1) % time_digits.len()) as i64;
     let l = secret.len();
 
@@ -65,16 +65,16 @@ fn decode_time_flow_string_time(str: &str, time_now: i64) -> ApiResult<String> {
         let mut new_index = res_index as i64;
 
         if add {
-            new_index = new_index + time_digits[time_digit_index as usize] * time_digit_index;
+            new_index += time_digits[time_digit_index as usize] * time_digit_index;
         } else {
             new_index = 2 * time_digit_index * time_digits[time_digit_index as usize] - new_index;
         }
 
         if new_index < 0 {
-            new_index = new_index * -1;
+            new_index = -new_index;
         }
 
-        new_index = new_index % secret.len() as i64;
+        new_index %= secret.len() as i64;
         let new_index_usize = new_index as usize;
 
         res[res_index] = secret[new_index_usize];
@@ -332,15 +332,16 @@ impl ExplorerApi for Client {
     async fn get_file_thumb(
         &self,
         path: &str,
-        _context_hint: Option<&str>,
+        context_hint: Option<&str>,
     ) -> ApiResult<FileThumbResponse> {
         let query = format!("?uri={}", urlencoding::encode(path));
 
-        // TODO: Add context hint header support if needed
         let mut response: FileThumbResponse = self
             .get(
                 &format!("/file/thumb{}", query),
-                RequestOptions::new().with_purchase_ticket(),
+                RequestOptions::new()
+                    .with_purchase_ticket()
+                    .with_context_hint(context_hint),
             )
             .await?;
 

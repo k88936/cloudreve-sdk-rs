@@ -254,6 +254,9 @@ pub struct FileThumbResponse {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
+    /// Cloudreve 4.19.x stock builds omit this field. Default to the
+    /// unobfuscated URL form instead of failing to deserialize the response.
+    #[serde(default)]
     pub obfuscated: bool,
 }
 
@@ -568,4 +571,25 @@ pub enum FileEvent {
     ReconnectRequired,
     /// Batch of file events with data
     Event(Vec<FileEventData>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FileThumbResponse;
+
+    #[test]
+    fn thumb_response_without_obfuscated_field() {
+        let response: FileThumbResponse =
+            serde_json::from_str(r#"{"url":"https://example.test/t.webp","expires":"soon"}"#)
+                .expect("stock Cloudreve 4.19 response must deserialize");
+        assert!(!response.obfuscated);
+        assert_eq!(response.url, "https://example.test/t.webp");
+    }
+
+    #[test]
+    fn thumb_response_decodes_obfuscated_flag() {
+        let response: FileThumbResponse =
+            serde_json::from_str(r#"{"url":"abc","obfuscated":true}"#).unwrap();
+        assert!(response.obfuscated);
+    }
 }

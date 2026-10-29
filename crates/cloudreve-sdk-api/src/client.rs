@@ -102,6 +102,9 @@ pub struct RequestOptions {
     pub skip_batch_error: bool,
     /// Skip lock conflict handling
     pub skip_lock_conflict: bool,
+    /// Context hint returned by a previous navigator listing. Sent as
+    /// `X-Cr-Context-Hint` to speed up follow-up operations.
+    pub context_hint: Option<String>,
 }
 
 impl RequestOptions {
@@ -126,6 +129,11 @@ impl RequestOptions {
 
     pub fn skip_lock_conflict(mut self) -> Self {
         self.skip_lock_conflict = true;
+        self
+    }
+
+    pub fn with_context_hint(mut self, context_hint: Option<&str>) -> Self {
+        self.context_hint = context_hint.map(str::to_owned);
         self
     }
 }
@@ -363,6 +371,13 @@ impl Client {
             request = request.header(
                 format!("{}Client-Id", CR_HEADER_PREFIX),
                 self.config.client_id.clone(),
+            );
+        }
+
+        if let Some(context_hint) = options.context_hint.as_deref() {
+            request = request.header(
+                format!("{}Context-Hint", CR_HEADER_PREFIX),
+                context_hint,
             );
         }
 

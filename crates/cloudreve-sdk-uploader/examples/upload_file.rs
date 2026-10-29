@@ -81,6 +81,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 last_modified,
                 overwrite: false,
                 previous_version: String::new(),
+                policy_id: String::new(),
+                metadata: None,
             },
             ConsoleProgress,
         )
