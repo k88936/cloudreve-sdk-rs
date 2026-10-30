@@ -1,7 +1,7 @@
 use cloudreve_sdk_api::api::UserApi;
 use cloudreve_sdk_api::{Client, ClientConfig};
 use cloudreve_sdk_uploader::{
-    ProgressCallback, ProgressUpdate, UploadParams, Uploader, UploaderConfig,
+    ProgressCallback, ProgressUpdate, UploadParams, UploadSource, Uploader, UploaderConfig,
 };
 use std::env;
 use std::error::Error;
@@ -74,9 +74,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     uploader
         .upload(
             UploadParams {
-                local_path,
+                source: UploadSource::from_path(&local_path)?,
                 remote_uri,
-                file_size: metadata.len(),
                 mime_type: None,
                 last_modified,
                 overwrite: false,

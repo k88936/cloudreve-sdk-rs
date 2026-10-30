@@ -12,6 +12,6 @@ extern crate cloudreve_sdk_api as cloudreve_api;
 mod uploader;
 
 pub use uploader::{
-    ProgressCallback, ProgressUpdate, UploadError, UploadParams, UploadResult, Uploader,
-    UploaderConfig,
+    ProgressCallback, ProgressUpdate, RangeOpener, SourceReader, UploadError, UploadParams,
+    UploadResult, UploadSource, Uploader, UploaderConfig,
 };

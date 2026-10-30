@@ -4,6 +4,8 @@
 //! multiple storage providers, encryption, retries, cancellation, and progress tracking.
 
 mod chunk;
+#[cfg(target_os = "android")]
+mod content_uri;
 mod encrypt;
 mod error;
 mod progress;
@@ -11,13 +13,17 @@ mod progress;
 mod providers;
 #[allow(dead_code)]
 mod session;
+mod session_store;
+mod source;
 
 use anyhow::{Context, Result};
 pub(crate) use chunk::ChunkProgress;
 use chunk::ChunkUploader;
 pub use error::{UploadError, UploadResult};
 pub use progress::{ProgressCallback, ProgressUpdate};
+pub use source::{RangeOpener, SourceReader, UploadSource};
 use session::UploadSession;
+use session_store::SessionStore;
 
 use cloudreve_api::{Client as CrClient, api::ExplorerApi};
 use reqwest::Client as HttpClient;
@@ -39,6 +45,8 @@ pub struct UploaderConfig {
     pub retry_max_delay: Duration,
     /// Request timeout for chunk uploads
     pub request_timeout: Duration,
+    /// Directory for durable session/chunk snapshots. `None` disables resume.
+    pub session_dir: Option<PathBuf>,
 }
 
 impl Default for UploaderConfig {
@@ -48,19 +56,27 @@ impl Default for UploaderConfig {
             retry_base_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(30),
             request_timeout: Duration::from_secs(60),
+            session_dir: None,
         }
+    }
+}
+
+impl UploaderConfig {
+    /// Enable resumable uploads with snapshots under `dir`.
+    pub fn with_session_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.session_dir = Some(dir.into());
+        self
     }
 }
 
 /// Parameters for initiating an upload
 #[derive(Debug, Clone)]
 pub struct UploadParams {
-    /// Local file path
-    pub local_path: PathBuf,
+    /// File/reader source. Use `UploadSource::from_path`,
+    /// `from_content_uri` (Android), or `from_reader` for custom readers.
+    pub source: UploadSource,
     /// Remote URI (cloudreve path)
     pub remote_uri: String,
-    /// File size in bytes
-    pub file_size: u64,
     /// File MIME type (optional)
     pub mime_type: Option<String>,
     /// Last modified timestamp (optional)
@@ -85,6 +101,8 @@ pub struct Uploader {
     config: UploaderConfig,
     /// Cancellation token for stopping uploads
     cancel_token: CancellationToken,
+    /// Optional durable session store.
+    session_store: Option<Arc<SessionStore>>,
 }
 
 impl Uploader {
@@ -95,11 +113,26 @@ impl Uploader {
             .build()
             .expect("Failed to create HTTP client");
 
+        let session_store = config.session_dir.as_ref().and_then(|dir| {
+            match SessionStore::new(dir) {
+                Ok(store) => Some(Arc::new(store)),
+                Err(error) => {
+                    warn!(
+                        target: "uploader",
+                        error = %error,
+                        "Upload session persistence disabled"
+                    );
+                    None
+                }
+            }
+        });
+
         Self {
             cr_client,
             http_client,
             config,
             cancel_token: CancellationToken::new(),
+            session_store,
         }
     }
 
@@ -124,25 +157,48 @@ impl Uploader {
     ) -> Result<()> {
         info!(
             target: "uploader",
-            local_path = %params.local_path.display(),
+            source = %params.source.display(),
             remote_uri = %params.remote_uri,
-            file_size = params.file_size,
+            file_size = params.source.size(),
             "Starting upload"
         );
 
-        let mut session = self.create_session(&params).await?;
+        let key = self.session_key(&params);
+        let mut session = match self.load_session(&params, &key).await {
+            Some(session) => {
+                info!(
+                    target: "uploader",
+                    session_id = %session.session_id(),
+                    uploaded = session.total_uploaded(),
+                    "Resuming persisted upload session"
+                );
+                session
+            }
+            None => {
+                let session = self.create_session(&params).await?;
+                self.persist_session(&key, &session).await;
+                session
+            }
+        };
 
         // Create chunk uploader based on policy type
         let chunk_uploader = self.create_chunk_uploader(&session)?;
+        let persistence = self.session_store.as_ref().map(|store| {
+            chunk::SessionPersistence {
+                store: Arc::clone(store),
+                key: key.clone(),
+            }
+        });
 
         // Upload all chunks
         let progress = Arc::new(progress);
         let result = chunk_uploader
             .upload_all(
-                &params.local_path,
+                &params.source,
                 &mut session,
                 progress,
                 &self.cancel_token,
+                persistence,
             )
             .await;
 
@@ -150,9 +206,12 @@ impl Uploader {
             Ok(()) => {
                 // Complete the upload
                 self.complete_upload(&session).await?;
+                if let Some(store) = &self.session_store {
+                    store.remove(&key).await;
+                }
                 info!(
                     target: "uploader",
-                    local_path = %params.local_path.display(),
+                    source = %params.source.display(),
                     "Upload completed successfully"
                 );
                 Ok(())
@@ -160,20 +219,79 @@ impl Uploader {
             Err(e) => {
                 error!(
                     target: "uploader",
-                    local_path = %params.local_path.display(),
+                    source = %params.source.display(),
                     error = %e,
                     "Upload failed"
                 );
-                if let Err(e) = self.delete_remote_session(&session).await {
+                if self.session_store.is_some() {
                     warn!(
                         target: "uploader",
-                        local_path = %params.local_path.display(),
+                        source = %params.source.display(),
+                        "Keeping upload session snapshot for resume"
+                    );
+                } else if let Err(e) = self.delete_remote_session(&session).await {
+                    warn!(
+                        target: "uploader",
+                        source = %params.source.display(),
                         error = %e,
                         "Failed to delete remote upload session"
                     );
                 }
-                Err(e.into())
+                Err(e)
             }
+        }
+    }
+
+    fn session_key(&self, params: &UploadParams) -> String {
+        SessionStore::key(
+            &params.remote_uri,
+            params.source.identifier(),
+            params.source.size(),
+            &params.policy_id,
+        )
+    }
+
+    async fn load_session(&self, params: &UploadParams, key: &str) -> Option<UploadSession> {
+        let store = self.session_store.as_ref()?;
+        let session = match store.load(key).await {
+            Ok(Some(session)) => session,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(
+                    target: "uploader",
+                    error = %error,
+                    "Ignoring unreadable upload session snapshot"
+                );
+                store.remove(key).await;
+                return None;
+            }
+        };
+        let valid = session.remote_uri == params.remote_uri
+            && session.file_size == params.source.size()
+            && session.source_id == params.source.identifier()
+            && !session.is_expired()
+            && session.num_chunks() > 0;
+        if !valid {
+            warn!(
+                target: "uploader",
+                session_id = %session.session_id(),
+                "Discarding stale upload session snapshot"
+            );
+            store.remove(key).await;
+            return None;
+        }
+        Some(session)
+    }
+
+    async fn persist_session(&self, key: &str, session: &UploadSession) {
+        if let Some(store) = &self.session_store
+            && let Err(error) = store.save(key, session).await
+        {
+            warn!(
+                target: "uploader",
+                error = %error,
+                "Failed to persist upload session; upload will continue"
+            );
         }
     }
 
@@ -194,7 +312,7 @@ impl Uploader {
         use cloudreve_api::models::explorer::{EncryptionCipher, UploadSessionRequest};
         let request = UploadSessionRequest {
             uri: params.remote_uri.clone(),
-            size: params.file_size as i64,
+            size: params.source.size() as i64,
             policy_id: params.policy_id.clone(),
             last_modified: params.last_modified,
             previous: (!params.previous_version.is_empty()).then(|| params.previous_version.clone()),
@@ -221,9 +339,9 @@ impl Uploader {
         let session = UploadSession::new(
             String::new(),
             String::new(),
-            params.local_path.to_string_lossy().to_string(),
+            params.source.identifier().to_string(),
             params.remote_uri.clone(),
-            params.file_size,
+            params.source.size(),
             credential,
         );
 

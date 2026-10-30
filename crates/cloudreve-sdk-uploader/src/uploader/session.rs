@@ -14,8 +14,8 @@ pub struct UploadSession {
     pub task_id: String,
     /// Drive ID
     pub drive_id: String,
-    /// Local file path
-    pub local_path: String,
+    /// Stable source identifier (path/fingerprint/content URI)
+    pub source_id: String,
     /// Remote URI (cloudreve path)
     pub remote_uri: String,
     /// Total file size
@@ -46,7 +46,7 @@ impl UploadSession {
     pub fn new(
         task_id: String,
         drive_id: String,
-        local_path: String,
+        source_id: String,
         remote_uri: String,
         file_size: u64,
         credential: UploadCredential,
@@ -68,7 +68,7 @@ impl UploadSession {
             id: credential.session_id.clone(),
             task_id,
             drive_id,
-            local_path,
+            source_id,
             remote_uri,
             file_size,
             chunk_size,
@@ -88,7 +88,7 @@ impl UploadSession {
         if file_size == 0 || chunk_size == 0 {
             return 1; // Empty file still needs one "chunk"
         }
-        ((file_size + chunk_size - 1) / chunk_size) as usize
+        file_size.div_ceil(chunk_size) as usize
     }
 
     /// Get the session ID from the credential
@@ -112,7 +112,7 @@ impl UploadSession {
 
     /// Check if the session has expired
     pub fn is_expired(&self) -> bool {
-        Utc::now().timestamp() >= self.expires_at
+        self.expires_at > 0 && Utc::now().timestamp() >= self.expires_at
     }
 
     /// Get total number of chunks

@@ -6,21 +6,21 @@ use crate::uploader::error::UploadError;
 use crate::uploader::progress::{ProgressCallback, ProgressTracker};
 use crate::uploader::providers::{self, PolicyType};
 use crate::uploader::session::UploadSession;
-use anyhow::{Context, Result};
+use crate::uploader::session_store::SessionStore;
+use crate::uploader::source::{SourceReader, UploadSource};
+use anyhow::Result;
 use bytes::Bytes;
 use cloudreve_api::Client as CrClient;
 use futures::Stream;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
-use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncSeekExt, BufReader, ReadBuf, SeekFrom};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{Mutex, Notify};
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
@@ -78,12 +78,10 @@ impl ChunkInfo {
 /// Buffer size for streaming reads (64KB)
 const STREAM_BUFFER_SIZE: usize = 64 * 1024;
 
-/// A limited async reader that reads only a specific range from a file,
-/// optionally applying encryption on-the-fly.
+/// A limited async reader that reads only one chunk range, optionally applying
+/// encryption on-the-fly. The source has already been range-limited.
 pub struct ChunkReader {
-    reader: BufReader<File>,
-    // handle: ArcWin32Handle,
-    // placeholder: Placeholder,
+    reader: SourceReader,
     encryption: Option<EncryptionConfig>,
     start_offset: u64,
     position: u64,
@@ -91,31 +89,19 @@ pub struct ChunkReader {
 }
 
 impl ChunkReader {
-    /// Create a new chunk reader for a specific byte range
-    pub async fn new(
-        path: &Path,
+    pub fn new(
+        reader: SourceReader,
         offset: u64,
         size: u64,
         encryption: Option<EncryptionConfig>,
-    ) -> Result<Self> {
-        // let placeholder = OpenOptions::new()
-        // .exclusive()
-        //     .open(path)
-        //     .context("failed to open file")?;
-        // let protected_handle = placeholder
-        //     .win32_handle()
-        //     .context("failed to get win32 handle")?;
-        let file = File::open(path).await.context("failed to open file")?;
-        let mut reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, file);
-        reader.seek(SeekFrom::Start(offset)).await?;
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             reader,
             encryption,
             start_offset: offset,
             position: 0,
             remaining: size,
-        })
+        }
     }
 
     /// Get the total size of this chunk
@@ -140,7 +126,6 @@ impl AsyncRead for ChunkReader {
         let mut limited_buf = buf.take(max_read);
         let before = limited_buf.filled().len();
 
-        // Pin the inner reader - this is safe because BufReader<File> is Unpin
         let reader = Pin::new(&mut self.reader);
 
         match reader.poll_read(cx, &mut limited_buf) {
@@ -195,14 +180,19 @@ impl ChunkStream {
         }
     }
 
-    /// Create a chunk stream from file path and chunk info
-    pub async fn from_chunk(
-        path: &Path,
+    /// Create a chunk stream from an upload source and chunk info.
+    pub async fn from_source(
+        source: &UploadSource,
         chunk: &ChunkInfo,
         encryption: Option<EncryptionConfig>,
     ) -> Result<Self> {
-        let reader = ChunkReader::new(path, chunk.offset, chunk.size, encryption).await?;
-        Ok(Self::new(reader))
+        let reader = source.open_range(chunk.offset, chunk.size).await?;
+        Ok(Self::new(ChunkReader::new(
+            reader,
+            chunk.offset,
+            chunk.size,
+            encryption,
+        )))
     }
 }
 
@@ -258,6 +248,25 @@ where
     }
 }
 
+/// Snapshot writer used after every completed chunk.
+#[derive(Clone)]
+pub(crate) struct SessionPersistence {
+    pub store: Arc<SessionStore>,
+    pub key: String,
+}
+
+impl SessionPersistence {
+    async fn save(&self, session: &UploadSession) {
+        if let Err(error) = self.store.save(&self.key, session).await {
+            warn!(
+                target: "uploader::chunk",
+                error = %error,
+                "Failed to persist upload session; continuing in memory"
+            );
+        }
+    }
+}
+
 /// Chunk uploader that handles uploading chunks to different providers
 pub struct ChunkUploader {
     http_client: HttpClient,
@@ -288,16 +297,17 @@ impl ChunkUploader {
     /// based on the session's storage policy configuration.
     pub async fn upload_all<P: ProgressCallback + 'static>(
         &self,
-        local_path: &Path,
+        source: &UploadSource,
         session: &mut UploadSession,
         progress_callback: Arc<P>,
         cancel_token: &CancellationToken,
+        persistence: Option<SessionPersistence>,
     ) -> Result<()> {
         let concurrency = session.chunk_concurrency();
 
         info!(
             target: "uploader::chunk",
-            local_path = %local_path.display(),
+            source = %source.display(),
             num_chunks = session.num_chunks(),
             policy_type = ?self.policy_type,
             concurrency = concurrency,
@@ -308,7 +318,7 @@ impl ChunkUploader {
         let encryption = session
             .encrypt_metadata
             .as_ref()
-            .map(|meta| EncryptionConfig::from_metadata(meta))
+            .map(EncryptionConfig::from_metadata)
             .transpose()?;
 
         // Get pending chunks
@@ -360,13 +370,14 @@ impl ChunkUploader {
         // Upload chunks with dynamic pool (works for any concurrency level)
         let result = self
             .upload_chunks_with_pool(
-                local_path,
+                source,
                 session,
                 &pending_chunks,
                 encryption,
                 &tracker,
                 cancel_token,
                 concurrency,
+                persistence,
             )
             .await;
 
@@ -386,15 +397,17 @@ impl ChunkUploader {
     /// - Starts up to `concurrency` uploads simultaneously
     /// - When a chunk completes, immediately starts the next pending chunk
     /// - Stops all uploads on first error
+    #[allow(clippy::too_many_arguments)]
     async fn upload_chunks_with_pool(
         &self,
-        local_path: &Path,
+        source: &UploadSource,
         session: &mut UploadSession,
         pending_chunks: &[usize],
         encryption: Option<EncryptionConfig>,
         tracker: &Arc<ProgressTracker>,
         cancel_token: &CancellationToken,
         concurrency: usize,
+        persistence: Option<SessionPersistence>,
     ) -> Result<()> {
         // Prepare chunk infos for pending chunks
         let chunk_infos: Vec<ChunkInfo> = pending_chunks
@@ -418,8 +431,8 @@ impl ChunkUploader {
             updated_at: session.updated_at,
         }));
 
-        // Local path needs to be owned for spawned tasks
-        let local_path = local_path.to_path_buf();
+        // The source is cheap to clone (Arc) and owns no mutable state.
+        let source = source.clone();
 
         // Spawn initial workers up to concurrency limit
         let mut handles = Vec::with_capacity(concurrency);
@@ -428,7 +441,7 @@ impl ChunkUploader {
             if let Some(chunk) = pool_state.next_chunk() {
                 pool_state.worker_started();
                 let handle = self.spawn_chunk_worker(
-                    local_path.clone(),
+                    source.clone(),
                     chunk,
                     encryption.clone(),
                     Arc::clone(tracker),
@@ -436,6 +449,7 @@ impl ChunkUploader {
                     Arc::clone(&pool_state),
                     Arc::clone(&progress_state),
                     Arc::clone(&shared_session),
+                    persistence.clone(),
                 );
                 handles.push(handle);
             }
@@ -475,9 +489,10 @@ impl ChunkUploader {
     }
 
     /// Spawn a worker task to upload chunks from the pool
+    #[allow(clippy::too_many_arguments)]
     fn spawn_chunk_worker(
         &self,
-        local_path: PathBuf,
+        source: UploadSource,
         initial_chunk: ChunkInfo,
         encryption: Option<EncryptionConfig>,
         tracker: Arc<ProgressTracker>,
@@ -485,6 +500,7 @@ impl ChunkUploader {
         pool_state: Arc<UploadPoolState>,
         progress_state: Arc<Mutex<ChunkProgressState>>,
         session: Arc<UploadSession>,
+        persistence: Option<SessionPersistence>,
     ) -> tokio::task::JoinHandle<()> {
         let http_client = self.http_client.clone();
         let cr_client = Arc::clone(&self.cr_client);
@@ -518,7 +534,7 @@ impl ChunkUploader {
                     &cr_client,
                     policy_type,
                     &config,
-                    &local_path,
+                    &source,
                     &chunk,
                     encryption.clone(),
                     &tracker,
@@ -531,8 +547,9 @@ impl ChunkUploader {
                     Ok(etag) => {
                         tracker.complete_chunk();
 
-                        // Update progress state
-                        {
+                        // Update progress state, then persist a durable
+                        // snapshot so a restart can skip this chunk.
+                        let snapshot = {
                             let mut state = progress_state.lock().await;
                             let chunk_size = chunk.size;
                             if chunk_index < state.chunk_progress.len() {
@@ -540,6 +557,13 @@ impl ChunkUploader {
                                 state.chunk_progress[chunk_index].etag = etag;
                                 state.updated_at = chrono::Utc::now().timestamp();
                             }
+                            let mut snapshot = session.as_ref().clone();
+                            snapshot.chunk_progress = state.chunk_progress.clone();
+                            snapshot.updated_at = state.updated_at;
+                            snapshot
+                        };
+                        if let Some(persistence) = &persistence {
+                            persistence.save(&snapshot).await;
                         }
 
                         debug!(
@@ -618,10 +642,10 @@ impl UploadPoolState {
     fn next_chunk(&self) -> Option<ChunkInfo> {
         // Use try_lock to avoid blocking in async context
         // If we can't get the lock, another worker is getting a chunk
-        if let Ok(mut chunks) = self.pending_chunks.try_lock() {
-            if !chunks.is_empty() {
-                return Some(chunks.remove(0));
-            }
+        if let Ok(mut chunks) = self.pending_chunks.try_lock()
+            && !chunks.is_empty()
+        {
+            return Some(chunks.remove(0));
         }
         None
     }
@@ -634,10 +658,10 @@ impl UploadPoolState {
     /// Set error state
     fn set_error(&self, msg: String) {
         self.has_error.store(true, Ordering::SeqCst);
-        if let Ok(mut error) = self.error.try_lock() {
-            if error.is_none() {
-                *error = Some(msg);
-            }
+        if let Ok(mut error) = self.error.try_lock()
+            && error.is_none()
+        {
+            *error = Some(msg);
         }
     }
 
@@ -679,12 +703,13 @@ impl UploadPoolState {
 }
 
 /// Upload a single chunk with retry logic
+#[allow(clippy::too_many_arguments)]
 async fn upload_chunk_with_retry(
     http_client: &HttpClient,
     cr_client: &Arc<CrClient>,
     policy_type: PolicyType,
     config: &UploaderConfig,
-    local_path: &Path,
+    source: &UploadSource,
     chunk: &ChunkInfo,
     encryption: Option<EncryptionConfig>,
     tracker: &Arc<ProgressTracker>,
@@ -718,7 +743,7 @@ async fn upload_chunk_with_retry(
         }
 
         // Create a fresh stream for each attempt
-        let inner_stream = ChunkStream::from_chunk(local_path, chunk, encryption.clone())
+        let inner_stream = ChunkStream::from_source(source, chunk, encryption.clone())
             .await
             .map_err(|e| UploadError::FileReadError(format!("Failed to create stream: {}", e)))?;
 

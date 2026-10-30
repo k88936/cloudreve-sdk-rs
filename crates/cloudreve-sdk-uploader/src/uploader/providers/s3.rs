@@ -268,10 +268,10 @@ fn build_complete_multipart_xml(chunks: &[ChunkProgress]) -> String {
 /// Format S3 error response for display
 fn format_s3_error(status: u16, body: &str) -> String {
     // Try to parse XML error
-    if let Some(code) = extract_xml_element(body, "Code") {
-        if let Some(message) = extract_xml_element(body, "Message") {
-            return format!("S3 error ({}): {}", code, message);
-        }
+    if let Some(code) = extract_xml_element(body, "Code")
+        && let Some(message) = extract_xml_element(body, "Message")
+    {
+        return format!("S3 error ({}): {}", code, message);
     }
 
     format!("HTTP {}: {}", status, body)

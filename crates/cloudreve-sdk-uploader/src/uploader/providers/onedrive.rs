@@ -100,16 +100,16 @@ where
 
     if let Ok(error) = serde_json::from_str::<OneDriveError>(&body) {
         // Check for fragment overlap error
-        if let Some(ref inner) = error.error.innererror {
-            if inner.code == "fragmentOverlap" {
-                // This is a recoverable error - the chunk was already uploaded
-                warn!(
-                    target: "uploader::onedrive",
-                    chunk = chunk.index,
-                    "Fragment overlap detected, chunk may be already uploaded"
-                );
-                bail!("OneDrive chunk overlap: {}", error.error.message);
-            }
+        if let Some(ref inner) = error.error.innererror
+            && inner.code == "fragmentOverlap"
+        {
+            // This is a recoverable error - the chunk was already uploaded
+            warn!(
+                target: "uploader::onedrive",
+                chunk = chunk.index,
+                "Fragment overlap detected, chunk may be already uploaded"
+            );
+            bail!("OneDrive chunk overlap: {}", error.error.message);
         }
 
         bail!(
