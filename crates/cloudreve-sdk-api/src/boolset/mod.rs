@@ -49,13 +49,13 @@ impl Boolset {
     /// Perform bitwise AND with another Boolset, returning a new Boolset
     pub fn and(&self, other: &Boolset) -> Boolset {
         let length = self.data.len().max(other.data.len());
-        let mut result = vec![0u8; length];
-
-        for i in 0..length {
-            let a = self.data.get(i).copied().unwrap_or(0);
-            let b = other.data.get(i).copied().unwrap_or(0);
-            result[i] = a & b;
-        }
+        let result = (0..length)
+            .map(|i| {
+                let a = self.data.get(i).copied().unwrap_or(0);
+                let b = other.data.get(i).copied().unwrap_or(0);
+                a & b
+            })
+            .collect();
 
         Boolset { data: result }
     }
@@ -63,13 +63,13 @@ impl Boolset {
     /// Perform bitwise OR with another Boolset, returning a new Boolset
     pub fn or(&self, other: &Boolset) -> Boolset {
         let length = self.data.len().max(other.data.len());
-        let mut result = vec![0u8; length];
-
-        for i in 0..length {
-            let a = self.data.get(i).copied().unwrap_or(0);
-            let b = other.data.get(i).copied().unwrap_or(0);
-            result[i] = a | b;
-        }
+        let result = (0..length)
+            .map(|i| {
+                let a = self.data.get(i).copied().unwrap_or(0);
+                let b = other.data.get(i).copied().unwrap_or(0);
+                a | b
+            })
+            .collect();
 
         Boolset { data: result }
     }

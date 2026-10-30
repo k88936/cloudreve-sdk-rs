@@ -302,21 +302,22 @@ impl CrUri {
                     res.updated_at_lte = v.parse().ok();
                 }
                 _ => {
-                    if k.starts_with(uri_query::METADATA_PREFIX) {
+                    if let Some(key) = k.strip_prefix(uri_query::METADATA_PREFIX) {
                         if res.metadata.is_none() {
                             res.metadata = Some(HashMap::new());
                         }
-                        let key = k[uri_query::METADATA_PREFIX.len()..].to_string();
-                        res.metadata.as_mut().unwrap().insert(key, v.to_string());
-                    } else if k.starts_with(uri_query::METADATA_STRONG_MATCH) {
+                        res.metadata
+                            .as_mut()
+                            .unwrap()
+                            .insert(key.to_string(), v.to_string());
+                    } else if let Some(key) = k.strip_prefix(uri_query::METADATA_STRONG_MATCH) {
                         if res.metadata_strong_match.is_none() {
                             res.metadata_strong_match = Some(HashMap::new());
                         }
-                        let key = k[uri_query::METADATA_STRONG_MATCH.len()..].to_string();
                         res.metadata_strong_match
                             .as_mut()
                             .unwrap()
-                            .insert(key, v.to_string());
+                            .insert(key.to_string(), v.to_string());
                     }
                 }
             }
@@ -334,7 +335,7 @@ impl CrUri {
     pub fn set_path(&mut self, path: &str) -> &mut Self {
         let encoded_segments: Vec<String> = path
             .split('/')
-            .map(|p| encode_uri_component(p))
+            .map(encode_uri_component)
             .collect();
         let encoded_path = encoded_segments.join("/");
         self.url.set_path(&encoded_path);
@@ -342,12 +343,14 @@ impl CrUri {
     }
 
     /// Set the username
+    #[allow(clippy::result_unit_err)]
     pub fn set_username(&mut self, username: &str) -> Result<&mut Self, ()> {
         self.url.set_username(username)?;
         Ok(self)
     }
 
     /// Set the password
+    #[allow(clippy::result_unit_err)]
     pub fn set_password(&mut self, password: &str) -> Result<&mut Self, ()> {
         self.url.set_password(Some(password))?;
         Ok(self)
@@ -402,7 +405,7 @@ impl CrUri {
 
         trimmed
             .split('/')
-            .map(|p| decode_uri_component(p))
+            .map(decode_uri_component)
             .collect()
     }
 
@@ -485,6 +488,7 @@ impl CrUri {
     }
 
     /// Convert the URI to a string
+    #[allow(clippy::inherent_to_string)]
     pub fn to_string(&self) -> String {
         self.url
             .to_string()
