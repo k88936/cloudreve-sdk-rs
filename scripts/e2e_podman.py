@@ -17,7 +17,7 @@ import urllib.request
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 IMAGE = os.environ.get(
-    "CLOUDREVE_E2E_IMAGE", "docker.io/cloudreve/cloudreve:4.18.0"
+    "CLOUDREVE_E2E_IMAGE", "docker.io/cloudreve/cloudreve:4.19.1"
 )
 CONTAINER = f"cloudreve-sdk-e2e-{os.getpid()}"
 EMAIL = "e2e-admin@example.test"
@@ -161,6 +161,38 @@ def main() -> None:
             "--",
             "Cargo.toml",
             f"cloudreve://my/{UPLOAD_NAME}",
+        ),
+        cwd=REPOSITORY,
+        env=example_environment,
+        check=True,
+    )
+
+    print("Running resumable chunk upload example", flush=True)
+    subprocess.run(
+        (
+            "cargo",
+            "run",
+            "--quiet",
+            "-p",
+            "cloudreve-sdk-uploader",
+            "--example",
+            "resume_upload",
+        ),
+        cwd=REPOSITORY,
+        env=example_environment,
+        check=True,
+    )
+
+    print("Running share-link CRUD example", flush=True)
+    subprocess.run(
+        (
+            "cargo",
+            "run",
+            "--quiet",
+            "-p",
+            "cloudreve-sdk-api",
+            "--example",
+            "share_crud",
         ),
         cwd=REPOSITORY,
         env=example_environment,
