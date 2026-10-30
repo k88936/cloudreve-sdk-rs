@@ -146,6 +146,8 @@ pub struct Share {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_readme: Option<bool>,
