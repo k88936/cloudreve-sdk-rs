@@ -7,7 +7,7 @@
 use std::fmt;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
@@ -79,15 +79,34 @@ impl UploadSource {
     }
 
     /// Upload an in-memory buffer.
+    ///
+    /// The default identifier is a SHA-256 of the content, computed lazily on
+    /// first use (and only when a session store needs a key). For large
+    /// buffers where the caller already has a stable id, prefer
+    /// [`Self::from_bytes_with_identifier`].
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
-        let bytes = Arc::new(bytes.into());
-        let mut hasher = Sha256::new();
-        hasher.update(bytes.as_slice());
-        let identifier = format!("bytes:{:x}", hasher.finalize());
         Self {
             inner: Arc::new(BytesSource {
-                bytes,
-                identifier,
+                bytes: Arc::new(bytes.into()),
+                identifier: OnceLock::new(),
+                explicit_identifier: None,
+            }),
+        }
+    }
+
+    /// Upload an in-memory buffer with a caller-supplied stable identifier.
+    ///
+    /// Use this when the caller owns an id that survives restarts (a document
+    /// id, a database row id, etc.); it avoids hashing the whole buffer.
+    pub fn from_bytes_with_identifier(
+        bytes: impl Into<Vec<u8>>,
+        identifier: impl Into<String>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(BytesSource {
+                bytes: Arc::new(bytes.into()),
+                identifier: OnceLock::new(),
+                explicit_identifier: Some(identifier.into()),
             }),
         }
     }
@@ -195,7 +214,21 @@ impl SourceImpl for PathSource {
 
 struct BytesSource {
     bytes: Arc<Vec<u8>>,
-    identifier: String,
+    identifier: OnceLock<String>,
+    explicit_identifier: Option<String>,
+}
+
+impl BytesSource {
+    fn identifier(&self) -> &str {
+        if let Some(identifier) = &self.explicit_identifier {
+            return identifier;
+        }
+        self.identifier.get_or_init(|| {
+            let mut hasher = Sha256::new();
+            hasher.update(self.bytes.as_slice());
+            format!("bytes:{:x}", hasher.finalize())
+        })
+    }
 }
 
 impl SourceImpl for BytesSource {
@@ -204,11 +237,13 @@ impl SourceImpl for BytesSource {
     }
 
     fn identifier(&self) -> &str {
-        &self.identifier
+        self.identifier()
     }
 
     fn display(&self) -> &str {
-        &self.identifier
+        self.explicit_identifier
+            .as_deref()
+            .unwrap_or("inline-buffer")
     }
 
     fn view(&self, offset: u64, len: u64) -> BoxFuture<'_, Result<SourceReader>> {
@@ -272,5 +307,17 @@ mod tests {
         assert_eq!(out, b"def");
         assert!(source.view(7, 2).await.is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bytes_identifier_is_stable_and_can_be_explicit() {
+        let source = UploadSource::from_bytes(b"hello".to_vec());
+        let first = source.identifier().to_string();
+        assert_eq!(first, source.identifier());
+        assert!(first.starts_with("bytes:"));
+
+        let explicit = UploadSource::from_bytes_with_identifier(b"hello".to_vec(), "doc-42");
+        assert_eq!(explicit.identifier(), "doc-42");
+        assert_eq!(explicit.display(), "doc-42");
     }
 }
