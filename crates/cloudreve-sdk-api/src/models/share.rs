@@ -11,6 +11,7 @@ where
 }
 
 /// Create or update a share link.
+// Mirrors Cloudreve's Go `ShareCreateService` request DTO; "Service" means request payload, not a stateful service.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ShareCreateService {
     /// Cloudreve URI of the file or folder to share.
