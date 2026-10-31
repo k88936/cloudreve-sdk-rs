@@ -148,6 +148,8 @@ impl UploadSource {
         self.inner.display()
     }
 
+    // TODO: this is the per-chunk range view; consider a `RangeView` that keeps
+    // offset/len instead of erasing them behind the boxed `SourceReader`.
     pub(crate) async fn open_range(&self, offset: u64, len: u64) -> Result<SourceReader> {
         if offset.checked_add(len).is_none_or(|end| end > self.size()) {
             bail!(
