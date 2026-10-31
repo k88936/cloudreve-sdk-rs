@@ -7,9 +7,14 @@ license = "MIT"
 documentation = "https://docs.rs/cloudreve-sdk-uploader"
 readme = "README.md"
 
+[features]
+default = ["session-store-fs"]
+session-store-fs = []
+
 [dependencies]
 aes = "0.8"
 anyhow = "1.0"
+async-trait = "0.1"
 base64 = "0.22"
 bytes = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
@@ -33,3 +38,7 @@ ndk-context = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+
+[[example]]
+name = "resume_upload"
+required-features = ["session-store-fs"]

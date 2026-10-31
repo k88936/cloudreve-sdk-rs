@@ -14,6 +14,8 @@ mod providers;
 #[allow(dead_code)]
 mod session;
 mod session_store;
+#[cfg(feature = "session-store-fs")]
+mod session_store_fs;
 mod source;
 
 use anyhow::{Context, Result};
@@ -21,13 +23,17 @@ pub(crate) use chunk::ChunkProgress;
 use chunk::ChunkUploader;
 pub use error::{UploadError, UploadResult};
 pub use progress::{ProgressCallback, ProgressUpdate};
+pub use session_store::{SessionKey, SessionStore, UploadIdentity};
+#[cfg(feature = "session-store-fs")]
+pub use session_store_fs::FileSessionStore;
 pub use source::{RangeOpener, SourceReader, UploadSource};
 use session::UploadSession;
-use session_store::SessionStore;
 
 use cloudreve_api::{Client as CrClient, api::ExplorerApi};
 use reqwest::Client as HttpClient;
 use std::collections::HashMap;
+use std::fmt;
+#[cfg(feature = "session-store-fs")]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Configuration for the uploader
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UploaderConfig {
     /// Maximum number of retry attempts per chunk
     pub max_retries: u32,
@@ -45,8 +51,31 @@ pub struct UploaderConfig {
     pub retry_max_delay: Duration,
     /// Request timeout for chunk uploads
     pub request_timeout: Duration,
-    /// Directory for durable session/chunk snapshots. `None` disables resume.
+    /// Custom durable session store. `None` disables resume unless a
+    /// file-system store is configured below.
+    pub session_store: Option<Arc<dyn SessionStore>>,
+    /// Directory for the built-in file-system session store. Takes effect only
+    /// when `session_store` is `None`.
+    #[cfg(feature = "session-store-fs")]
     pub session_dir: Option<PathBuf>,
+}
+
+impl fmt::Debug for UploaderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("UploaderConfig");
+        debug
+            .field("max_retries", &self.max_retries)
+            .field("retry_base_delay", &self.retry_base_delay)
+            .field("retry_max_delay", &self.retry_max_delay)
+            .field("request_timeout", &self.request_timeout)
+            .field(
+                "session_store",
+                &self.session_store.as_ref().map(|_| "<configured>"),
+            );
+        #[cfg(feature = "session-store-fs")]
+        debug.field("session_dir", &self.session_dir);
+        debug.finish()
+    }
 }
 
 impl Default for UploaderConfig {
@@ -56,13 +85,22 @@ impl Default for UploaderConfig {
             retry_base_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(30),
             request_timeout: Duration::from_secs(60),
+            session_store: None,
+            #[cfg(feature = "session-store-fs")]
             session_dir: None,
         }
     }
 }
 
 impl UploaderConfig {
-    /// Enable resumable uploads with snapshots under `dir`.
+    /// Use a custom durable session store.
+    pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.session_store = Some(store);
+        self
+    }
+
+    /// Enable resumable uploads with the built-in file-system store under `dir`.
+    #[cfg(feature = "session-store-fs")]
     pub fn with_session_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.session_dir = Some(dir.into());
         self
@@ -102,7 +140,7 @@ pub struct Uploader {
     /// Cancellation token for stopping uploads
     cancel_token: CancellationToken,
     /// Optional durable session store.
-    session_store: Option<Arc<SessionStore>>,
+    session_store: Option<Arc<dyn SessionStore>>,
 }
 
 impl Uploader {
@@ -113,19 +151,26 @@ impl Uploader {
             .build()
             .expect("Failed to create HTTP client");
 
-        let session_store = config.session_dir.as_ref().and_then(|dir| {
-            match SessionStore::new(dir) {
-                Ok(store) => Some(Arc::new(store)),
-                Err(error) => {
-                    warn!(
-                        target: "uploader",
-                        error = %error,
-                        "Upload session persistence disabled"
-                    );
-                    None
+        #[cfg(feature = "session-store-fs")]
+        let session_store = if let Some(store) = config.session_store.clone() {
+            Some(store)
+        } else {
+            config.session_dir.as_ref().and_then(|dir| {
+                match FileSessionStore::new(dir) {
+                    Ok(store) => Some(Arc::new(store) as Arc<dyn SessionStore>),
+                    Err(error) => {
+                        warn!(
+                            target: "uploader",
+                            error = %error,
+                            "Upload session persistence disabled"
+                        );
+                        None
+                    }
                 }
-            }
-        });
+            })
+        };
+        #[cfg(not(feature = "session-store-fs"))]
+        let session_store = config.session_store.clone();
 
         Self {
             cr_client,
@@ -163,8 +208,17 @@ impl Uploader {
             "Starting upload"
         );
 
-        let key = self.session_key(&params);
-        let mut session = match self.load_session(&params, &key).await {
+        // Without a store there is no snapshot key to compute; skipping it also
+        // avoids hashing an in-memory source when resume is disabled.
+        let key = self
+            .session_store
+            .as_ref()
+            .map(|_| self.session_key(&params));
+        let loaded = match &key {
+            Some(key) => self.load_session(&params, key).await,
+            None => None,
+        };
+        let mut session = match loaded {
             Some(session) => {
                 info!(
                     target: "uploader",
@@ -176,19 +230,22 @@ impl Uploader {
             }
             None => {
                 let session = self.create_session(&params).await?;
-                self.persist_session(&key, &session).await;
+                if let Some(key) = &key {
+                    self.persist_session(key, &session).await;
+                }
                 session
             }
         };
 
         // Create chunk uploader based on policy type
         let chunk_uploader = self.create_chunk_uploader(&session)?;
-        let persistence = self.session_store.as_ref().map(|store| {
-            chunk::SessionPersistence {
+        let persistence = match (&self.session_store, &key) {
+            (Some(store), Some(key)) => Some(chunk::SessionPersistence {
                 store: Arc::clone(store),
                 key: key.clone(),
-            }
-        });
+            }),
+            _ => None,
+        };
 
         // Upload all chunks
         let progress = Arc::new(progress);
@@ -206,8 +263,14 @@ impl Uploader {
             Ok(()) => {
                 // Complete the upload
                 self.complete_upload(&session).await?;
-                if let Some(store) = &self.session_store {
-                    store.remove(&key).await;
+                if let (Some(store), Some(key)) = (&self.session_store, &key)
+                    && let Err(error) = store.remove(key).await
+                {
+                    warn!(
+                        target: "uploader",
+                        error = %error,
+                        "Failed to remove upload session snapshot"
+                    );
                 }
                 info!(
                     target: "uploader",
@@ -242,16 +305,21 @@ impl Uploader {
         }
     }
 
-    fn session_key(&self, params: &UploadParams) -> String {
-        SessionStore::key(
-            &params.remote_uri,
-            params.source.identifier(),
-            params.source.size(),
-            &params.policy_id,
-        )
+    fn session_key(&self, params: &UploadParams) -> SessionKey {
+        SessionKey::for_upload(&UploadIdentity {
+            remote_uri: &params.remote_uri,
+            source_id: params.source.identifier(),
+            size: params.source.size(),
+            policy_id: &params.policy_id,
+            mime_type: params.mime_type.as_deref(),
+            last_modified: params.last_modified,
+            overwrite: params.overwrite,
+            previous_version: &params.previous_version,
+            metadata: params.metadata.as_ref(),
+        })
     }
 
-    async fn load_session(&self, params: &UploadParams, key: &str) -> Option<UploadSession> {
+    async fn load_session(&self, params: &UploadParams, key: &SessionKey) -> Option<UploadSession> {
         let store = self.session_store.as_ref()?;
         let session = match store.load(key).await {
             Ok(Some(session)) => session,
@@ -262,7 +330,13 @@ impl Uploader {
                     error = %error,
                     "Ignoring unreadable upload session snapshot"
                 );
-                store.remove(key).await;
+                if let Err(error) = store.remove(key).await {
+                    warn!(
+                        target: "uploader",
+                        error = %error,
+                        "Failed to remove unreadable upload session snapshot"
+                    );
+                }
                 return None;
             }
         };
@@ -277,13 +351,19 @@ impl Uploader {
                 session_id = %session.session_id(),
                 "Discarding stale upload session snapshot"
             );
-            store.remove(key).await;
+            if let Err(error) = store.remove(key).await {
+                warn!(
+                    target: "uploader",
+                    error = %error,
+                    "Failed to remove stale upload session snapshot"
+                );
+            }
             return None;
         }
         Some(session)
     }
 
-    async fn persist_session(&self, key: &str, session: &UploadSession) {
+    async fn persist_session(&self, key: &SessionKey, session: &UploadSession) {
         if let Some(store) = &self.session_store
             && let Err(error) = store.save(key, session).await
         {
@@ -305,6 +385,17 @@ impl Uploader {
     #[allow(dead_code)]
     pub fn is_cancelled(&self) -> bool {
         self.cancel_token.is_cancelled()
+    }
+
+    /// Remove expired snapshots from the configured store.
+    ///
+    /// Returns the number of removed snapshots; stores without garbage
+    /// collection return `0`.
+    pub async fn prune_sessions(&self, now_unix: i64) -> Result<usize> {
+        match &self.session_store {
+            Some(store) => store.prune(now_unix).await,
+            None => Ok(0),
+        }
     }
 
     /// Create a new upload session via Cloudreve API

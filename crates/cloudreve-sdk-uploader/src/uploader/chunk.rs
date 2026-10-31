@@ -6,7 +6,7 @@ use crate::uploader::error::UploadError;
 use crate::uploader::progress::{ProgressCallback, ProgressTracker};
 use crate::uploader::providers::{self, PolicyType};
 use crate::uploader::session::UploadSession;
-use crate::uploader::session_store::SessionStore;
+use crate::uploader::session_store::{SessionKey, SessionStore};
 use crate::uploader::source::{SourceReader, UploadSource};
 use anyhow::Result;
 use bytes::Bytes;
@@ -251,8 +251,8 @@ where
 /// Snapshot writer used after every completed chunk.
 #[derive(Clone)]
 pub(crate) struct SessionPersistence {
-    pub store: Arc<SessionStore>,
-    pub key: String,
+    pub store: Arc<dyn SessionStore>,
+    pub key: SessionKey,
 }
 
 impl SessionPersistence {
