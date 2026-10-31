@@ -167,7 +167,20 @@ def main() -> None:
         check=True,
     )
 
-    print("Running resumable chunk upload example", flush=True)
+    print(
+        "Running resumable chunk upload example (first phase: persist one chunk)",
+        flush=True,
+    )
+    resume_dir = REPOSITORY / "target" / f"resume-e2e-{os.getpid()}"
+    shutil.rmtree(resume_dir, ignore_errors=True)
+    resume_environment = example_environment.copy()
+    resume_environment.update(
+        {
+            "CLOUDREVE_RESUME_DIR": str(resume_dir),
+            "CLOUDREVE_RESUME_NAME": "cloudreve-sdk-resume-e2e.bin",
+            "CLOUDREVE_RESUME_MB": "64",
+        }
+    )
     subprocess.run(
         (
             "cargo",
@@ -179,9 +192,29 @@ def main() -> None:
             "resume_upload",
         ),
         cwd=REPOSITORY,
-        env=example_environment,
+        env={**resume_environment, "CLOUDREVE_RESUME_PHASE": "first"},
         check=True,
     )
+
+    print(
+        "Running resumable chunk upload example (second phase: new process resumes)",
+        flush=True,
+    )
+    subprocess.run(
+        (
+            "cargo",
+            "run",
+            "--quiet",
+            "-p",
+            "cloudreve-sdk-uploader",
+            "--example",
+            "resume_upload",
+        ),
+        cwd=REPOSITORY,
+        env={**resume_environment, "CLOUDREVE_RESUME_PHASE": "second"},
+        check=True,
+    )
+    shutil.rmtree(resume_dir, ignore_errors=True)
 
     print("Running share-link CRUD example", flush=True)
     subprocess.run(
