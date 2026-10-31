@@ -27,7 +27,7 @@ trait SourceImpl: Send + Sync {
     fn size(&self) -> u64;
     fn identifier(&self) -> &str;
     fn display(&self) -> &str;
-    fn open_range(&self, offset: u64, len: u64) -> BoxFuture<'_, Result<SourceReader>>;
+    fn view(&self, offset: u64, len: u64) -> BoxFuture<'_, Result<SourceReader>>;
 }
 
 /// A reusable, cloneable upload source.
@@ -123,7 +123,7 @@ impl UploadSource {
         let opener: RangeOpener = Arc::new(move |offset, len| {
             let uri = uri.clone();
             Box::pin(async move {
-                crate::uploader::content_uri::open_range(&uri, offset, len).await
+                crate::uploader::content_uri::view(&uri, offset, len).await
             })
         });
         Ok(Self {
@@ -150,14 +150,14 @@ impl UploadSource {
 
     // TODO: this is the per-chunk range view; consider a `RangeView` that keeps
     // offset/len instead of erasing them behind the boxed `SourceReader`.
-    pub(crate) async fn open_range(&self, offset: u64, len: u64) -> Result<SourceReader> {
+    pub(crate) async fn view(&self, offset: u64, len: u64) -> Result<SourceReader> {
         if offset.checked_add(len).is_none_or(|end| end > self.size()) {
             bail!(
                 "upload range {offset}+{len} exceeds source size {}",
                 self.size()
             );
         }
-        self.inner.open_range(offset, len).await
+        self.inner.view(offset, len).await
     }
 }
 
@@ -181,7 +181,7 @@ impl SourceImpl for PathSource {
         &self.display
     }
 
-    fn open_range(&self, offset: u64, len: u64) -> BoxFuture<'_, Result<SourceReader>> {
+    fn view(&self, offset: u64, len: u64) -> BoxFuture<'_, Result<SourceReader>> {
         Box::pin(async move {
             let file = File::open(&self.path)
                 .await
@@ -211,7 +211,7 @@ impl SourceImpl for BytesSource {
         &self.identifier
     }
 
-    fn open_range(&self, offset: u64, len: u64) -> BoxFuture<'_, Result<SourceReader>> {
+    fn view(&self, offset: u64, len: u64) -> BoxFuture<'_, Result<SourceReader>> {
         Box::pin(async move {
             let start = offset as usize;
             let end = (offset + len) as usize;
@@ -241,7 +241,7 @@ impl SourceImpl for ReaderSource {
         &self.display
     }
 
-    fn open_range(&self, offset: u64, len: u64) -> BoxFuture<'_, Result<SourceReader>> {
+    fn view(&self, offset: u64, len: u64) -> BoxFuture<'_, Result<SourceReader>> {
         (self.opener)(offset, len)
     }
 }
@@ -255,7 +255,7 @@ mod tests {
     async fn bytes_source_reads_ranges() {
         let source = UploadSource::from_bytes(b"0123456789".to_vec());
         assert_eq!(source.size(), 10);
-        let mut reader = source.open_range(2, 4).await.unwrap();
+        let mut reader = source.view(2, 4).await.unwrap();
         let mut out = Vec::new();
         reader.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, b"2345");
@@ -266,11 +266,11 @@ mod tests {
         let path = std::env::temp_dir().join(format!("source-range-{}", std::process::id()));
         std::fs::write(&path, b"abcdefgh").unwrap();
         let source = UploadSource::from_path(&path).unwrap();
-        let mut reader = source.open_range(3, 3).await.unwrap();
+        let mut reader = source.view(3, 3).await.unwrap();
         let mut out = Vec::new();
         reader.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, b"def");
-        assert!(source.open_range(7, 2).await.is_err());
+        assert!(source.view(7, 2).await.is_err());
         let _ = std::fs::remove_file(path);
     }
 }

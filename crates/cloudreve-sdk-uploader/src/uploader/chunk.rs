@@ -186,7 +186,7 @@ impl ChunkStream {
         chunk: &ChunkInfo,
         encryption: Option<EncryptionConfig>,
     ) -> Result<Self> {
-        let reader = source.open_range(chunk.offset, chunk.size).await?;
+        let reader = source.view(chunk.offset, chunk.size).await?;
         Ok(Self::new(ChunkReader::new(
             reader,
             chunk.offset,

@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom};
 
 use super::source::SourceReader;
 
-pub(crate) async fn open_range(
+pub(crate) async fn view(
     uri: &str,
     offset: u64,
     len: u64,
