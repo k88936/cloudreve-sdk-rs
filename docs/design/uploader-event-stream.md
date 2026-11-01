@@ -1,6 +1,6 @@
 # Uploader redesign: the upload *is* an event stream
 
-Status: agreed design; implemented by the commits that follow this document.
+Status: implemented.
 
 ## Motivation
 
@@ -229,7 +229,7 @@ Types and functions:
 Members:
 
 - `UploaderConfig::{session_store, session_dir}`, `UploaderConfig::{with_session_store, with_session_dir}`
-- `Uploader::{session_store, with_cancel_token, prune_sessions}`
+- `Uploader::{cancel, is_cancelled, session_store, with_cancel_token, prune_sessions}`
 
 Features:
 

@@ -11,8 +11,30 @@ cloudreve-sdk-uploader = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-The runnable example logs in, creates an uploader, reports progress, and uploads one file. The
-remote argument must be a complete Cloudreve file URI, including the destination filename.
+An upload is a stream of events. `upload()` creates the session and hands back the session
+plus the events the upload produces; nothing is transferred until the stream is polled, and
+dropping the stream cancels the upload.
+
+```rust
+let stream = uploader.upload(params).await?;
+let mut events = stream.events;
+
+while let Some(event) = events.next().await {
+    match event {
+        UploadEvent::ChunkDone(_) => {}   // one chunk finished; also the line a log writes
+        UploadEvent::Completed => break,  // or UploadEvent::Failed(error)
+        UploadEvent::Failed(error) => return Err(error.into()),
+    }
+}
+```
+
+Progress is a fold over those events: the `Tracker` (behind the default-on `progress`
+feature) borrows each event and yields a `ProgressUpdate`, so a single loop can print
+progress and persist the finished chunks at the same time.
+
+The runnable example logs in, creates an uploader, and uploads one file while printing
+progress. The remote argument must be a complete Cloudreve file URI, including the
+destination filename.
 
 ```bash
 export CLOUDREVE_SERVER="https://cloudreve.example"
@@ -24,3 +46,7 @@ cargo run -p cloudreve-sdk-uploader --example upload_file -- \
 ```
 
 See [`examples/upload_file.rs`](examples/upload_file.rs) for the complete code.
+
+`examples/resume_upload.rs` shows the other half: an upload that is interrupted on purpose,
+a journal of its finished chunks, and `Uploader::try_resume` picking it back up without
+re-sending them.
