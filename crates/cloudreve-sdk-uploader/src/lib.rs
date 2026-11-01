@@ -14,7 +14,7 @@ mod uploader;
 #[cfg(feature = "session-store-fs")]
 pub use uploader::FileSessionStore;
 pub use uploader::{
-    ProgressCallback, ProgressUpdate, RangeOpener, SessionKey, SessionStore, SourceReader,
-    UploadError, UploadIdentity, UploadParams, UploadResult, UploadSession, UploadSource, Uploader,
-    UploaderConfig,
+    ProgressCallback, ProgressUpdate, RangeOpener, SNAPSHOT_VERSION, SessionKey, SessionStore,
+    Snapshot, SourceReader, UploadError, UploadIdentity, UploadParams, UploadResult, UploadSession,
+    UploadSource, Uploader, UploaderConfig, decode_snapshot, encode_snapshot,
 };

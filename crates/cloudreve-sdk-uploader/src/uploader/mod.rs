@@ -16,6 +16,7 @@ mod session;
 mod session_store;
 #[cfg(feature = "session-store-fs")]
 mod session_store_fs;
+mod snapshot;
 mod source;
 
 use anyhow::{Context, Result};
@@ -27,6 +28,9 @@ pub use session::UploadSession;
 pub use session_store::{SessionKey, SessionStore, UploadIdentity};
 #[cfg(feature = "session-store-fs")]
 pub use session_store_fs::FileSessionStore;
+pub use snapshot::{
+    SNAPSHOT_VERSION, Snapshot, decode as decode_snapshot, encode as encode_snapshot,
+};
 pub use source::{RangeOpener, SourceReader, UploadSource};
 
 use cloudreve_api::{Client as CrClient, api::ExplorerApi};

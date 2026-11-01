@@ -9,7 +9,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 
 use super::session::UploadSession;
-use super::session_store::{SNAPSHOT_VERSION, SessionKey, SessionStore, Snapshot};
+use super::session_store::{SessionKey, SessionStore};
+use super::snapshot::{Snapshot, encode};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -59,10 +60,10 @@ impl SessionStore for FileSessionStore {
                 });
             }
         };
-        let snapshot: Snapshot = serde_json::from_slice(&bytes).with_context(|| {
+        let snapshot = Snapshot::decode(&bytes).with_context(|| {
             format!("failed to decode upload session {}", path.display())
         })?;
-        if snapshot.version != SNAPSHOT_VERSION {
+        if !snapshot.is_supported() {
             let _ = tokio::fs::remove_file(&path).await;
             return Ok(None);
         }
@@ -72,11 +73,7 @@ impl SessionStore for FileSessionStore {
     async fn save(&self, key: &SessionKey, session: &UploadSession) -> Result<()> {
         let path = self.path(key);
         let tmp = self.temp_path(key);
-        let bytes = serde_json::to_vec(&Snapshot {
-            version: SNAPSHOT_VERSION,
-            session: session.clone(),
-        })
-        .context("failed to encode upload session")?;
+        let bytes = encode(session).context("failed to encode upload session")?;
 
         tokio::fs::write(&tmp, bytes)
             .await
@@ -123,9 +120,9 @@ impl SessionStore for FileSessionStore {
                 }
                 Some("json") => {
                     let expired = match tokio::fs::read(&path).await {
-                        Ok(bytes) => match serde_json::from_slice::<Snapshot>(&bytes) {
+                        Ok(bytes) => match Snapshot::decode(&bytes) {
                             Ok(snapshot) => {
-                                snapshot.version != SNAPSHOT_VERSION
+                                !snapshot.is_supported()
                                     || (snapshot.session.expires_at > 0
                                         && snapshot.session.expires_at <= now_unix)
                             }

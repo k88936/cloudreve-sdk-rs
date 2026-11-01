@@ -13,22 +13,9 @@ use std::fmt;
 
 use anyhow::Result;
 use async_trait::async_trait;
-#[cfg(feature = "session-store-fs")]
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::session::UploadSession;
-
-#[cfg(feature = "session-store-fs")]
-pub(crate) const SNAPSHOT_VERSION: u32 = 1;
-
-/// Serialized snapshot format shared by stores that persist JSON.
-#[cfg(feature = "session-store-fs")]
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Snapshot {
-    pub version: u32,
-    pub session: UploadSession,
-}
 
 /// Stable identity of one upload attempt.
 ///
