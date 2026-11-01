@@ -16,9 +16,7 @@ mod encrypt;
 mod error;
 #[cfg(feature = "progress")]
 mod progress;
-#[allow(dead_code)]
 mod providers;
-#[allow(dead_code)]
 mod session;
 mod source;
 mod stream;
