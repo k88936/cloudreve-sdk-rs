@@ -147,9 +147,11 @@ Read-only derivations stay: `session_id()`, `credential()`, `policy_type()`, `is
   `upload()`/`try_resume()`. Everything afterwards arrives as `Failed(UploadError)`.
 - **No automatic resume.** `upload()` always creates a new session. Resuming is an explicit
   `try_resume()` call, normally fed by a log the caller just read.
-- **`SessionExpired` is reported, not repaired.** When the server no longer knows the
-  session, `try_resume()` (or the stream) surfaces `UploadError::SessionExpired`; the caller
-  owns the log and deletes it. `error::is_remote_session_lost` still does the detection.
+- **`SessionExpired` is reported, not repaired.** `try_resume()` refuses a session whose
+  local `expires_at` has passed before it builds a stream, and when the server no longer
+  knows the session the stream reports `UploadError::SessionExpired` after the first chunk
+  of the attempt is rejected. Either way the caller owns the log and deletes it;
+  `error::is_remote_session_lost` does the server-side detection.
 - **No source validation.** The caller must pass the bytes that produced the recorded
   chunks. Nothing compares sizes, mtimes or content. See Risks. `try_resume` only warns
   when the source size differs from the session, it never refuses.

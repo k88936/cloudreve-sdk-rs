@@ -153,6 +153,18 @@ impl Uploader {
         source: UploadSource,
         completed: impl IntoIterator<Item = ChunkProgress>,
     ) -> Result<UploadStream> {
+        // An expired credential fails every chunk, so there is no point in
+        // starting: say why while the caller can still act synchronously.
+        if session.is_expired() {
+            warn!(
+                target: "uploader",
+                session_id = %session.session_id(),
+                expires_at = session.expires_at,
+                "Refusing to resume an expired upload session"
+            );
+            return Err(UploadError::SessionExpired.into());
+        }
+
         let completed: Vec<ChunkProgress> = completed.into_iter().collect();
         info!(
             target: "uploader",
@@ -372,6 +384,29 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[tokio::test]
+    async fn try_resume_refuses_a_locally_expired_session() {
+        let uploader = Uploader::new(
+            Arc::new(CrClient::new(ClientConfig::new("http://127.0.0.1:1"))),
+            UploaderConfig::default(),
+        );
+        let mut expired = session(2);
+        expired.expires_at = 1;
+
+        let error = uploader
+            .try_resume(expired, UploadSource::from_bytes(vec![0u8; 10]), Vec::new())
+            .await
+            .expect_err("an expired session must be refused");
+
+        assert!(
+            matches!(
+                error.downcast_ref::<UploadError>(),
+                Some(UploadError::SessionExpired)
+            ),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[tokio::test]
