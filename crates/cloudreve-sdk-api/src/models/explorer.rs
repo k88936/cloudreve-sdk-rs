@@ -333,6 +333,7 @@ pub struct PermissionSettingReq {
 pub struct CreateFileService {
     pub uri: String,
     #[serde(rename = "type")]
+    //TODO refactor use enum
     pub file_type: String, // "file" or "folder"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub err_on_conflict: Option<bool>,
