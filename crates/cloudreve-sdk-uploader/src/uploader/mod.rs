@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use transfer::{ChunkFuture, ChunkStarter, ChunkTransfer, Finalizer};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub use chunk_progress::ChunkProgress;
 pub use error::{UploadError, UploadResult};
@@ -163,6 +163,20 @@ impl Uploader {
             total_chunks = session.num_chunks(),
             "Resuming upload"
         );
+
+        // Nothing compares content, so this is the only hint that the caller is
+        // resuming with the wrong file. It is a warning, not an error: only the
+        // caller knows whether the difference is expected.
+        if source.size() != session.file_size {
+            warn!(
+                target: "uploader",
+                session_id = %session.session_id(),
+                session_size = session.file_size,
+                source_size = source.size(),
+                "Resuming with a source of a different size: the provider will \
+                 assemble a file from chunks of different files"
+            );
+        }
 
         self.start_transfer(session, source, completed, true)
     }
