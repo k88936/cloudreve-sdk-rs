@@ -1,114 +1,57 @@
-//! Progress reporting for uploads with byte-level tracking, speed calculation,
-//! and support for concurrent chunk uploads.
+//! Progress as a fold over upload events.
+//!
+//! The uploader reports what happened — one chunk finished — and how far the
+//! whole file got is a fold over those events. [`Tracker`] is that fold as an
+//! explicit state machine instead of a stream combinator: it *borrows* an event
+//! rather than consuming it, so one loop can feed a log, a progress bar and
+//! anything else without buffering, teeing or back-pressure.
+//!
+//! Everything here is client-side arithmetic. Cloudreve reports no upload
+//! progress, so the numbers are derived from completed chunks and event arrival
+//! times.
 
-use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
-/// Progress update information sent to callbacks
-#[derive(Clone)]
+use crate::uploader::chunk_progress::ChunkProgress;
+use crate::uploader::session::UploadSession;
+use crate::uploader::stream::UploadEvent;
+
+/// How far an upload got, recomputed after every finished chunk.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProgressUpdate {
     /// Total file size in bytes
     pub total_size: u64,
-    /// Total bytes uploaded so far
+    /// Bytes held by finished chunks
     pub uploaded: u64,
-    /// Progress percentage (0.0 - 1.0)
+    /// Progress ratio (0.0 - 1.0)
     pub progress: f64,
-    /// Current upload speed in bytes per second
+    /// Recent upload speed in bytes per second
     pub speed_bytes_per_sec: u64,
-    /// Estimated time remaining in seconds (None if speed is 0)
+    /// Estimated time remaining in seconds (`None` until a speed is known)
     pub eta_seconds: Option<u64>,
-    /// Number of chunks being uploaded concurrently
-    pub concurrent_chunks: usize,
     /// Total number of chunks
     pub total_chunks: usize,
-    /// Completed chunk count
+    /// Finished chunk count
     pub completed_chunks: usize,
 }
 
-impl Debug for ProgressUpdate {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Progress: {:.1}% ({} / {}) @ {} | ETA: {} | Chunks: {}/{} ({} active)",
-            self.progress * 100.0,
-            format_bytes(self.uploaded),
-            format_bytes(self.total_size),
-            format_speed(self.speed_bytes_per_sec),
-            format_eta(self.eta_seconds),
-            self.completed_chunks,
-            self.total_chunks,
-            self.concurrent_chunks,
-        )
-    }
-}
-
-/// Format bytes into human-readable string (e.g., "10.5 MB")
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    const TB: u64 = GB * 1024;
-
-    if bytes >= TB {
-        format!("{:.2} TB", bytes as f64 / TB as f64)
-    } else if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
-/// Format speed into human-readable string (e.g., "10.5 MB/s")
-fn format_speed(bytes_per_sec: u64) -> String {
-    format!("{}/s", format_bytes(bytes_per_sec))
-}
-
-/// Format ETA into human-readable string (e.g., "2m 30s")
-fn format_eta(eta_seconds: Option<u64>) -> String {
-    match eta_seconds {
-        None => "N/A".to_string(),
-        Some(0) => "0s".to_string(),
-        Some(secs) => {
-            let hours = secs / 3600;
-            let minutes = (secs % 3600) / 60;
-            let seconds = secs % 60;
-
-            if hours > 0 {
-                format!("{}h {}m {}s", hours, minutes, seconds)
-            } else if minutes > 0 {
-                format!("{}m {}s", minutes, seconds)
-            } else {
-                format!("{}s", seconds)
-            }
-        }
-    }
-}
-
 impl ProgressUpdate {
-    /// Create a new progress update
-    pub fn new(
+    fn build(
         total_size: u64,
         uploaded: u64,
         speed_bytes_per_sec: u64,
-        concurrent_chunks: usize,
         total_chunks: usize,
         completed_chunks: usize,
     ) -> Self {
-        let progress = if total_size > 0 {
-            (uploaded as f64 / total_size as f64).clamp(0.0, 1.0)
-        } else {
+        let uploaded = uploaded.min(total_size);
+        let progress = if total_size == 0 {
             1.0
+        } else {
+            (uploaded as f64 / total_size as f64).clamp(0.0, 1.0)
         };
-
         let eta_seconds = if speed_bytes_per_sec > 0 && uploaded < total_size {
-            Some((total_size - uploaded) / speed_bytes_per_sec)
+            Some((total_size - uploaded).div_ceil(speed_bytes_per_sec))
         } else {
             None
         };
@@ -119,179 +62,198 @@ impl ProgressUpdate {
             progress,
             speed_bytes_per_sec,
             eta_seconds,
-            concurrent_chunks,
             total_chunks,
             completed_chunks,
         }
     }
 }
 
-/// Trait for receiving progress updates
-pub trait ProgressCallback: Send + Sync {
-    /// Called when upload progress changes
-    fn on_progress(&self, update: ProgressUpdate);
-}
-
-/// No-op progress callback implementation
-#[allow(dead_code)]
-pub struct NoOpProgress;
-
-impl ProgressCallback for NoOpProgress {
-    fn on_progress(&self, _update: ProgressUpdate) {}
-}
-
-/// Closure-based progress callback
-#[allow(dead_code)]
-pub struct FnProgress<F>(pub F);
-
-impl<F> ProgressCallback for FnProgress<F>
-where
-    F: Fn(ProgressUpdate) + Send + Sync,
-{
-    fn on_progress(&self, update: ProgressUpdate) {
-        (self.0)(update)
-    }
-}
-
-/// Arc wrapper for progress callbacks
-impl<T: ProgressCallback> ProgressCallback for Arc<T> {
-    fn on_progress(&self, update: ProgressUpdate) {
-        (**self).on_progress(update)
-    }
-}
-
-/// Box wrapper for progress callbacks
-impl ProgressCallback for Box<dyn ProgressCallback> {
-    fn on_progress(&self, update: ProgressUpdate) {
-        (**self).on_progress(update)
-    }
-}
-
-/// Speed calculator using sliding window for accurate speed measurement
-struct SpeedCalculator {
-    /// Bytes recorded at different time points for sliding window
+/// Folds [`UploadEvent`]s into [`ProgressUpdate`]s.
+///
+/// Seed it with the records replayed from a resume log, then hand it every event
+/// of the stream:
+///
+/// ```ignore
+/// let mut tracker = Tracker::new(&stream.session, &completed);
+/// println!("{:?}", tracker.current());
+/// while let Some(event) = events.next().await {
+///     if let Some(update) = tracker.observe(&event) {
+///         println!("{update:?}");
+///     }
+///     // the same event can still be matched and written to a log
+/// }
+/// ```
+pub struct Tracker {
+    total_size: u64,
+    total_chunks: usize,
+    uploaded: u64,
+    completed_chunks: usize,
+    /// Sliding window for the speed estimate.
+    window: Duration,
     samples: Vec<(Instant, u64)>,
-    /// Window size for speed calculation (2 seconds)
-    window_duration: Duration,
 }
 
-impl SpeedCalculator {
-    fn new() -> Self {
-        Self {
-            samples: Vec::with_capacity(32),
-            window_duration: Duration::from_secs(10),
-        }
-    }
-
-    /// Record a sample and calculate current speed
-    fn record_and_calculate(&mut self, total_bytes: u64) -> u64 {
-        let now = Instant::now();
-
-        // Add new sample
-        self.samples.push((now, total_bytes));
-
-        // Remove samples outside the window
-        let cutoff = now - self.window_duration;
-        self.samples.retain(|(t, _)| *t >= cutoff);
-
-        // Calculate speed from oldest sample in window
-        if self.samples.len() >= 2 {
-            let (oldest_time, oldest_bytes) = self.samples.first().unwrap();
-            let elapsed = now.duration_since(*oldest_time);
-            if elapsed.as_millis() > 0 {
-                let bytes_diff = total_bytes.saturating_sub(*oldest_bytes);
-                return (bytes_diff as f64 / elapsed.as_secs_f64()) as u64;
+impl Tracker {
+    /// Seed a tracker for `session`.
+    ///
+    /// `completed` are the records already known, usually read back from a
+    /// resume log. The last record per index wins, so a retried chunk is not
+    /// counted twice, and records outside the session are ignored.
+    pub fn new(session: &UploadSession, completed: &[ChunkProgress]) -> Self {
+        let total_chunks = session.num_chunks();
+        let mut known = BTreeMap::new();
+        for record in completed {
+            if record.index < total_chunks {
+                known.insert(record.index, record.loaded);
             }
         }
 
-        0
-    }
-}
-
-/// Thread-safe progress tracker for concurrent chunk uploads.
-///
-/// This tracker:
-/// - Uses atomic counters for byte-level tracking across concurrent uploads
-/// - Calculates upload speed using a sliding window
-/// - Throttles progress reports to avoid performance drain
-/// - Supports tracking multiple concurrent chunk uploads
-pub struct ProgressTracker {
-    /// Total file size
-    total_size: u64,
-    /// Total bytes uploaded (atomic for concurrent access)
-    uploaded_bytes: AtomicU64,
-    /// Number of active concurrent chunk uploads
-    active_chunks: AtomicU64,
-    /// Total number of chunks
-    total_chunks: usize,
-    /// Number of completed chunks
-    completed_chunks: AtomicU64,
-    /// Speed calculator (protected by RwLock)
-    speed_calc: RwLock<SpeedCalculator>,
-    /// Cached speed value
-    cached_speed: AtomicU64,
-}
-
-impl ProgressTracker {
-    /// Create a new progress tracker
-    pub fn new(total_size: u64, total_chunks: usize) -> Arc<Self> {
-        Arc::new(Self {
-            total_size,
-            uploaded_bytes: AtomicU64::new(0),
-            active_chunks: AtomicU64::new(0),
+        Self {
+            total_size: session.file_size,
             total_chunks,
-            completed_chunks: AtomicU64::new(0),
-            speed_calc: RwLock::new(SpeedCalculator::new()),
-            cached_speed: AtomicU64::new(0),
-        })
+            uploaded: known.values().sum(),
+            completed_chunks: known.len(),
+            window: Duration::from_secs(10),
+            samples: Vec::with_capacity(16),
+        }
     }
 
-    /// Called when starting to upload a chunk
-    pub fn start_chunk(&self) {
-        self.active_chunks.fetch_add(1, Ordering::SeqCst);
+    /// The progress before any event of this run arrives.
+    pub fn current(&self) -> ProgressUpdate {
+        ProgressUpdate::build(
+            self.total_size,
+            self.uploaded,
+            0,
+            self.total_chunks,
+            self.completed_chunks,
+        )
     }
 
-    /// Called when a chunk upload completes
-    pub fn complete_chunk(&self) {
-        self.active_chunks.fetch_sub(1, Ordering::SeqCst);
-        self.completed_chunks.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Add bytes uploaded within current chunk(s)
-    /// This is the in-flight bytes for active chunks
-    pub fn add_bytes(&self, bytes: u64) {
-        self.uploaded_bytes.fetch_add(bytes, Ordering::SeqCst);
-    }
-
-    /// Reset in-flight bytes for a chunk (called before retry)
-    pub fn reset_chunk_bytes(&self, bytes: u64) {
-        self.uploaded_bytes.fetch_sub(bytes, Ordering::SeqCst);
-    }
-
-    /// Get total uploaded bytes (completed + in-flight)
-    pub fn total_uploaded(&self) -> u64 {
-        self.uploaded_bytes.load(Ordering::SeqCst)
-    }
-
-    /// Force create a progress update (for final report)
-    pub async fn create_update(&self) -> ProgressUpdate {
-        let total_uploaded = self.total_uploaded();
-
-        // Calculate speed
-        let speed = {
-            let mut calc = self.speed_calc.write().await;
-            let speed = calc.record_and_calculate(total_uploaded);
-            self.cached_speed.store(speed, Ordering::SeqCst);
-            speed
+    /// Fold one event.
+    ///
+    /// Returns a fresh [`ProgressUpdate`] for every finished chunk and `None`
+    /// for terminal events: they carry no progress of their own.
+    pub fn observe(&mut self, event: &UploadEvent) -> Option<ProgressUpdate> {
+        let UploadEvent::ChunkDone(record) = event else {
+            return None;
         };
 
-        ProgressUpdate::new(
+        self.uploaded += record.loaded;
+        self.completed_chunks += 1;
+        let speed = self.measure_speed();
+
+        Some(ProgressUpdate::build(
             self.total_size,
-            total_uploaded,
+            self.uploaded,
             speed,
-            self.active_chunks.load(Ordering::SeqCst) as usize,
             self.total_chunks,
-            self.completed_chunks.load(Ordering::SeqCst) as usize,
+            self.completed_chunks,
+        ))
+    }
+
+    /// Bytes per second over the last [`Self::window`], or `0` without enough
+    /// samples yet.
+    fn measure_speed(&mut self) -> u64 {
+        let now = Instant::now();
+        self.samples.push((now, self.uploaded));
+
+        let cutoff = now.checked_sub(self.window).unwrap_or(now);
+        self.samples.retain(|(at, _)| *at >= cutoff);
+
+        let Some((oldest_at, oldest_uploaded)) = self.samples.first().copied() else {
+            return 0;
+        };
+        let elapsed = now.duration_since(oldest_at).as_secs_f64();
+        if self.samples.len() < 2 || elapsed <= 0.0 {
+            return 0;
+        }
+
+        ((self.uploaded - oldest_uploaded) as f64 / elapsed) as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cloudreve_api::models::explorer::UploadCredential;
+
+    fn session(num_chunks: usize) -> UploadSession {
+        UploadSession::new(
+            "file:/a".into(),
+            "cloudreve://my/a.bin".into(),
+            num_chunks as u64 * 5,
+            UploadCredential {
+                session_id: "session-1".into(),
+                expires: 4_000_000_000,
+                chunk_size: 5,
+                ..Default::default()
+            },
         )
+    }
+
+    fn record(index: usize) -> ChunkProgress {
+        ChunkProgress::new(index, 5, None)
+    }
+
+    #[test]
+    fn seeds_from_replayed_records_without_double_counting() {
+        let tracker = Tracker::new(&session(3), &[record(0), record(1), record(1)]);
+        let update = tracker.current();
+
+        assert_eq!(update.uploaded, 10);
+        assert_eq!(update.completed_chunks, 2);
+        assert_eq!(update.total_chunks, 3);
+        assert_eq!(update.total_size, 15);
+        assert_eq!(update.speed_bytes_per_sec, 0);
+        assert!((update.progress - 2.0 / 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ignores_records_outside_the_session() {
+        let tracker = Tracker::new(&session(2), &[record(0), record(7)]);
+        let update = tracker.current();
+
+        assert_eq!(update.uploaded, 5);
+        assert_eq!(update.completed_chunks, 1);
+    }
+
+    #[test]
+    fn emits_only_for_finished_chunks() {
+        let mut tracker = Tracker::new(&session(2), &[]);
+
+        assert!(tracker.observe(&UploadEvent::Completed).is_none());
+        assert!(
+            tracker
+                .observe(&UploadEvent::Failed(
+                    crate::uploader::error::UploadError::SessionExpired
+                ))
+                .is_none()
+        );
+        assert!(tracker.observe(&UploadEvent::ChunkDone(record(0))).is_some());
+    }
+
+    #[test]
+    fn reaches_full_progress_on_the_last_chunk() {
+        let mut tracker = Tracker::new(&session(2), &[]);
+
+        tracker.observe(&UploadEvent::ChunkDone(record(0)));
+        let last = tracker
+            .observe(&UploadEvent::ChunkDone(record(1)))
+            .expect("chunk event");
+
+        assert_eq!(last.uploaded, last.total_size);
+        assert_eq!(last.progress, 1.0);
+        assert_eq!(last.completed_chunks, 2);
+        assert_eq!(last.eta_seconds, None);
+    }
+
+    #[test]
+    fn an_empty_file_is_complete_before_it_starts() {
+        let tracker = Tracker::new(&session(1), &[]);
+        let mut empty = Tracker::new(&session(1), &[]);
+        empty.total_size = 0;
+
+        assert_eq!(tracker.current().progress, 0.0);
+        assert_eq!(empty.current().progress, 1.0);
     }
 }

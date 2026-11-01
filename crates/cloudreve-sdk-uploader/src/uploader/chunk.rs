@@ -1,29 +1,31 @@
-//! Chunk-based upload logic with streaming support and progress tracking
+//! Chunk transport: read one byte range and stream it to the provider.
+//!
+//! This module knows nothing about progress, sessions or persistence. It turns
+//! a chunk into an HTTP body, retries what is worth retrying, and returns the
+//! provider's ETag. The upload stream ([`super::transfer`]) decides what
+//! happens next.
 
-use crate::uploader::UploaderConfig;
-use crate::uploader::chunk_progress::{ChunkProgress, CompletionSet};
-use crate::uploader::encrypt::EncryptionConfig;
-use crate::uploader::error::{self, UploadError};
-use crate::uploader::progress::{ProgressCallback, ProgressTracker};
-use crate::uploader::providers::{self, PolicyType};
-use crate::uploader::session::UploadSession;
-use crate::uploader::source::{SourceReader, UploadSource};
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
+
 use anyhow::Result;
 use bytes::Bytes;
 use cloudreve_api::Client as CrClient;
 use futures::Stream;
 use reqwest::Client as HttpClient;
-use std::io;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::task::{Context as TaskContext, Poll};
-use std::time::Duration;
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::{Mutex, Notify};
 use tokio_util::io::ReaderStream;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
+
+use crate::uploader::UploaderConfig;
+use crate::uploader::encrypt::EncryptionConfig;
+use crate::uploader::error::{self, UploadError};
+use crate::uploader::providers::{self, PolicyType};
+use crate::uploader::session::UploadSession;
+use crate::uploader::source::{SourceReader, UploadSource};
 
 /// Metadata about a single chunk (without the data)
 #[derive(Debug, Clone)]
@@ -44,6 +46,12 @@ impl ChunkInfo {
             offset,
             size,
         }
+    }
+
+    /// Describe chunk `index` of `session`.
+    pub fn of(session: &UploadSession, index: usize) -> Self {
+        let (offset, _end) = session.chunk_range(index);
+        Self::new(index, offset, session.chunk_size_for(index))
     }
 }
 
@@ -176,460 +184,12 @@ impl Stream for ChunkStream {
     }
 }
 
-/// A stream wrapper that tracks progress at byte level.
-/// Reports progress through the ProgressTracker with throttling.
-pub struct ProgressStream<S> {
-    inner: S,
-    tracker: Arc<ProgressTracker>,
-    /// Shared counter for bytes sent, accessible after stream is consumed
-    bytes_sent_counter: Arc<AtomicU64>,
-}
-
-impl<S> ProgressStream<S> {
-    /// Create a new progress-aware stream
-    pub fn new(inner: S, tracker: Arc<ProgressTracker>) -> Self {
-        Self {
-            inner,
-            tracker,
-            bytes_sent_counter: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    /// Get a handle to the bytes sent counter that remains valid after stream is consumed
-    pub fn bytes_sent_counter(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.bytes_sent_counter)
-    }
-}
-
-impl<S> Stream for ProgressStream<S>
-where
-    S: Stream<Item = Result<Bytes, io::Error>> + Unpin,
-{
-    type Item = Result<Bytes, io::Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                let len = bytes.len() as u64;
-                self.bytes_sent_counter.fetch_add(len, Ordering::SeqCst);
-                self.tracker.add_bytes(len);
-                Poll::Ready(Some(Ok(bytes)))
-            }
-            other => other,
-        }
-    }
-}
-
-/// Chunk uploader that handles uploading chunks to different providers
-pub struct ChunkUploader {
-    http_client: HttpClient,
-    cr_client: Arc<CrClient>,
-    policy_type: PolicyType,
-    config: UploaderConfig,
-}
-
-impl ChunkUploader {
-    /// Create a new chunk uploader
-    pub fn new(
-        http_client: HttpClient,
-        cr_client: Arc<CrClient>,
-        policy_type: PolicyType,
-        config: UploaderConfig,
-    ) -> Self {
-        Self {
-            http_client,
-            cr_client,
-            policy_type,
-            config,
-        }
-    }
-
-    /// Upload all chunks for a file with progress tracking
-    ///
-    /// Supports both sequential (concurrency=1) and concurrent chunk uploads
-    /// based on the session's storage policy configuration.
-    pub async fn upload_all<P: ProgressCallback + 'static>(
-        &self,
-        source: &UploadSource,
-        session: &UploadSession,
-        progress_callback: Arc<P>,
-        cancel_token: &CancellationToken,
-    ) -> Result<CompletionSet> {
-        let concurrency = session.chunk_concurrency();
-        let num_chunks = session.num_chunks();
-
-        info!(
-            target: "uploader::chunk",
-            source = %source.display(),
-            num_chunks = num_chunks,
-            policy_type = ?self.policy_type,
-            concurrency = concurrency,
-            "Starting chunk upload"
-        );
-
-        // Get encryption config if needed
-        let encryption = session
-            .encrypt_metadata
-            .as_ref()
-            .map(EncryptionConfig::from_metadata)
-            .transpose()?;
-
-        if cancel_token.is_cancelled() {
-            return Err(UploadError::Cancelled.into());
-        }
-
-        let pending_chunks: Vec<usize> = (0..num_chunks).collect();
-
-        // Create progress tracker
-        let tracker = ProgressTracker::new(session.file_size, num_chunks);
-
-        // Spawn progress reporter task
-        let reporter_tracker = Arc::clone(&tracker);
-        let reporter_cancel = cancel_token.clone();
-        let reporter_callback = Arc::clone(&progress_callback);
-
-        let reporter_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                        let update = reporter_tracker.create_update().await;
-                        reporter_callback.on_progress(update);
-                    }
-                    _ = reporter_cancel.cancelled() => {
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Upload chunks with dynamic pool (works for any concurrency level)
-        let result = self
-            .upload_chunks_with_pool(
-                source,
-                session,
-                &pending_chunks,
-                encryption,
-                &tracker,
-                cancel_token,
-                concurrency,
-            )
-            .await;
-
-        // Stop the reporter
-        reporter_handle.abort();
-
-        // Send final progress update
-        let final_update = tracker.create_update().await;
-        progress_callback.on_progress(final_update);
-
-        result
-    }
-
-    /// Upload chunks using a dynamic worker pool
-    ///
-    /// Uses a dynamic pool pattern:
-    /// - Starts up to `concurrency` uploads simultaneously
-    /// - When a chunk completes, immediately starts the next pending chunk
-    /// - Stops all uploads on first error
-    #[allow(clippy::too_many_arguments)]
-    async fn upload_chunks_with_pool(
-        &self,
-        source: &UploadSource,
-        session: &UploadSession,
-        pending_chunks: &[usize],
-        encryption: Option<EncryptionConfig>,
-        tracker: &Arc<ProgressTracker>,
-        cancel_token: &CancellationToken,
-        concurrency: usize,
-    ) -> Result<CompletionSet> {
-        // Prepare chunk infos for pending chunks
-        let chunk_infos: Vec<ChunkInfo> = pending_chunks
-            .iter()
-            .map(|&index| {
-                let (offset, _end) = session.chunk_range(index);
-                let chunk_size = session.chunk_size_for(index);
-                ChunkInfo::new(index, offset, chunk_size)
-            })
-            .collect();
-
-        // Clone session for read-only access in spawned tasks
-        let shared_session = Arc::new(session.clone());
-
-        // Shared state for the dynamic pool
-        let pool_state = Arc::new(UploadPoolState::new(chunk_infos));
-
-        // Shared completion records (protected by mutex)
-        let completed = Arc::new(Mutex::new(CompletionSet::new(
-            session.num_chunks(),
-            Vec::new(),
-        )));
-
-        // The source is cheap to clone (Arc) and owns no mutable state.
-        let source = source.clone();
-
-        // Spawn initial workers up to concurrency limit
-        let mut handles = Vec::with_capacity(concurrency);
-
-        for _ in 0..concurrency {
-            if let Some(chunk) = pool_state.next_chunk() {
-                pool_state.worker_started();
-                let handle = self.spawn_chunk_worker(
-                    source.clone(),
-                    chunk,
-                    encryption.clone(),
-                    Arc::clone(tracker),
-                    cancel_token.clone(),
-                    Arc::clone(&pool_state),
-                    Arc::clone(&completed),
-                    Arc::clone(&shared_session),
-                );
-                handles.push(handle);
-            }
-        }
-
-        // Wait for all handles to complete
-        for handle in handles {
-            let _ = handle.await;
-        }
-
-        // Wait for any dynamically spawned workers to complete
-        pool_state.wait_for_completion().await;
-
-        // Every worker is done, so the shared set can be unwrapped without waiting.
-        let completed = match Arc::try_unwrap(completed) {
-            Ok(completed) => completed.into_inner(),
-            Err(shared) => shared.lock().await.clone(),
-        };
-
-        // Check if there was an error
-        if let Some(error_msg) = pool_state.get_error() {
-            error!(
-                target: "uploader::chunk",
-                error = %error_msg,
-                "Upload failed"
-            );
-            return Err(anyhow::anyhow!("Upload failed: {}", error_msg));
-        }
-
-        // Workers stop silently once cancellation is observed. Treat that as a
-        // cancellation/partial upload instead of reporting success.
-        if cancel_token.is_cancelled() {
-            return Err(UploadError::Cancelled.into());
-        }
-        if completed.len() != session.num_chunks() {
-            let missing = (0..session.num_chunks()).find(|index| !completed.contains(*index));
-            return Err(anyhow::anyhow!(
-                "upload ended with chunk {:?} pending",
-                missing
-            ));
-        }
-
-        info!(
-            target: "uploader::chunk",
-            uploaded_bytes = completed.uploaded(),
-            "All chunks uploaded successfully"
-        );
-
-        Ok(completed)
-    }
-
-    /// Spawn a worker task to upload chunks from the pool
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_chunk_worker(
-        &self,
-        source: UploadSource,
-        initial_chunk: ChunkInfo,
-        encryption: Option<EncryptionConfig>,
-        tracker: Arc<ProgressTracker>,
-        cancel_token: CancellationToken,
-        pool_state: Arc<UploadPoolState>,
-        completed: Arc<Mutex<CompletionSet>>,
-        session: Arc<UploadSession>,
-    ) -> tokio::task::JoinHandle<()> {
-        let http_client = self.http_client.clone();
-        let cr_client = Arc::clone(&self.cr_client);
-        let policy_type = self.policy_type;
-        let config = self.config.clone();
-
-        tokio::spawn(async move {
-            // Process chunks in a loop until no more chunks or error
-            let mut current_chunk = Some(initial_chunk);
-
-            while let Some(chunk) = current_chunk.take() {
-                // Don't start new uploads if there's already an error or cancelled
-                if pool_state.has_error() || cancel_token.is_cancelled() {
-                    pool_state.worker_done();
-                    return;
-                }
-
-                let chunk_index = chunk.index;
-                tracker.start_chunk();
-
-                debug!(
-                    target: "uploader::chunk",
-                    chunk = chunk_index,
-                    active = pool_state.active_count(),
-                    "Starting chunk upload"
-                );
-
-                // Upload the chunk with retries
-                let result = upload_chunk_with_retry(
-                    &http_client,
-                    &cr_client,
-                    policy_type,
-                    &config,
-                    &source,
-                    &chunk,
-                    encryption.clone(),
-                    &tracker,
-                    &cancel_token,
-                    &session,
-                )
-                .await;
-
-                match result {
-                    Ok(etag) => {
-                        tracker.complete_chunk();
-
-                        // Record the chunk before taking the next one: the
-                        // record is what a resumed upload replays.
-                        completed
-                            .lock()
-                            .await
-                            .insert(ChunkProgress::new(chunk_index, chunk.size, etag));
-
-                        debug!(
-                            target: "uploader::chunk",
-                            chunk = chunk_index,
-                            "Chunk uploaded successfully"
-                        );
-
-                        // Get next chunk and continue
-                        current_chunk = pool_state.next_chunk();
-                    }
-                    Err(e) => {
-                        error!(
-                            target: "uploader::chunk",
-                            chunk = chunk_index,
-                            error = ?e,
-                            "Chunk upload failed, stopping all uploads"
-                        );
-
-                        // Mark error state to stop all uploads
-                        pool_state.set_error(e.to_string());
-                        cancel_token.cancel();
-                        pool_state.worker_done();
-                        return;
-                    }
-                }
-            }
-
-            pool_state.worker_done();
-        })
-    }
-}
-
-// =========================================================================
-// Upload Pool Support Types
-// =========================================================================
-
-/// State management for chunk uploads with dynamic worker pool
-struct UploadPoolState {
-    /// Chunks waiting to be uploaded
-    pending_chunks: Mutex<Vec<ChunkInfo>>,
-    /// Error message if any upload failed
-    error: Mutex<Option<String>>,
-    /// Flag indicating an error occurred
-    has_error: AtomicBool,
-    /// Number of active workers
-    active_workers: AtomicUsize,
-    /// Notify when all workers are done
-    all_done: Notify,
-}
-
-impl UploadPoolState {
-    fn new(chunks: Vec<ChunkInfo>) -> Self {
-        Self {
-            pending_chunks: Mutex::new(chunks),
-            error: Mutex::new(None),
-            has_error: AtomicBool::new(false),
-            active_workers: AtomicUsize::new(0),
-            all_done: Notify::new(),
-        }
-    }
-
-    /// Increment active worker count - call before spawning a worker
-    fn worker_started(&self) {
-        self.active_workers.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Get the next chunk to upload, if any
-    fn next_chunk(&self) -> Option<ChunkInfo> {
-        // Use try_lock to avoid blocking in async context
-        // If we can't get the lock, another worker is getting a chunk
-        if let Ok(mut chunks) = self.pending_chunks.try_lock()
-            && !chunks.is_empty()
-        {
-            return Some(chunks.remove(0));
-        }
-        None
-    }
-
-    /// Check if an error has occurred
-    fn has_error(&self) -> bool {
-        self.has_error.load(Ordering::SeqCst)
-    }
-
-    /// Set error state
-    fn set_error(&self, msg: String) {
-        self.has_error.store(true, Ordering::SeqCst);
-        if let Ok(mut error) = self.error.try_lock()
-            && error.is_none()
-        {
-            *error = Some(msg);
-        }
-    }
-
-    /// Get the error message if any
-    fn get_error(&self) -> Option<String> {
-        self.error.try_lock().ok().and_then(|e| e.clone())
-    }
-
-    /// Get current active worker count
-    fn active_count(&self) -> usize {
-        self.active_workers.load(Ordering::SeqCst)
-    }
-
-    /// Mark a worker as done
-    fn worker_done(&self) {
-        let prev = self.active_workers.fetch_sub(1, Ordering::SeqCst);
-        if prev == 1 {
-            // Last worker, notify waiters
-            self.all_done.notify_waiters();
-        }
-    }
-
-    /// Wait for all workers to complete
-    async fn wait_for_completion(&self) {
-        loop {
-            // Register for notification BEFORE checking condition
-            // This prevents missing a notification that happens between check and await
-            let notified = self.all_done.notified();
-
-            if self.active_workers.load(Ordering::SeqCst) == 0 {
-                return;
-            }
-
-            // Now safe to await - if notification happened after our check,
-            // we'll still receive it since we registered first
-            notified.await;
-        }
-    }
-}
-
-/// Upload a single chunk with retry logic
+/// Upload one chunk, retrying failures that are worth retrying.
+///
+/// The future owns the request, so dropping it (which is what dropping the
+/// upload stream does) cancels the transfer.
 #[allow(clippy::too_many_arguments)]
-async fn upload_chunk_with_retry(
+pub(crate) async fn upload_chunk_with_retry(
     http_client: &HttpClient,
     cr_client: &Arc<CrClient>,
     policy_type: PolicyType,
@@ -637,15 +197,9 @@ async fn upload_chunk_with_retry(
     source: &UploadSource,
     chunk: &ChunkInfo,
     encryption: Option<EncryptionConfig>,
-    tracker: &Arc<ProgressTracker>,
-    cancel_token: &CancellationToken,
-    session: &Arc<UploadSession>,
+    session: &UploadSession,
 ) -> Result<Option<String>> {
     for attempt in 0..=config.max_retries {
-        if cancel_token.is_cancelled() {
-            return Err(anyhow::anyhow!("Upload cancelled"));
-        }
-
         if attempt > 0 {
             let base = config.retry_base_delay.as_millis() as u64;
             let delay_ms = base * (1 << attempt.min(10));
@@ -659,33 +213,16 @@ async fn upload_chunk_with_retry(
                 "Retrying chunk upload"
             );
 
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
-                _ = cancel_token.cancelled() => {
-                    return Err(anyhow::anyhow!("Upload cancelled during retry delay"));
-                }
-            }
+            tokio::time::sleep(delay).await;
         }
 
-        // Create a fresh stream for each attempt
-        let inner_stream = ChunkStream::from_source(source, chunk, encryption.clone())
+        // A fresh stream per attempt: the previous body is spent.
+        let stream = ChunkStream::from_source(source, chunk, encryption.clone())
             .await
-            .map_err(|e| UploadError::FileReadError(format!("Failed to create stream: {}", e)))?;
+            .map_err(|error| UploadError::FileReadError(format!("Failed to create stream: {error}")))?;
 
-        // Wrap with progress tracking
-        let progress_stream = ProgressStream::new(inner_stream, Arc::clone(tracker));
-        // Capture bytes counter before stream is consumed
-        let bytes_sent_counter = progress_stream.bytes_sent_counter();
-
-        match providers::upload_chunk(
-            http_client,
-            cr_client,
-            policy_type,
-            chunk,
-            progress_stream,
-            session.as_ref(),
-        )
-        .await
+        match providers::upload_chunk(http_client, cr_client, policy_type, chunk, stream, session)
+            .await
         {
             Ok(etag) => {
                 debug!(
@@ -696,27 +233,23 @@ async fn upload_chunk_with_retry(
                 );
                 return Ok(etag);
             }
-            Err(e) => {
-                // Use the captured counter to get bytes sent after stream was consumed
-                let bytes_sent = bytes_sent_counter.load(Ordering::SeqCst);
-                tracker.reset_chunk_bytes(bytes_sent);
+            Err(error) => {
                 // The server answered and rejected the request: another
-                // attempt (or another session) is what could help, not another
-                // retry of the same one.
-                if attempt == config.max_retries || error::is_remote_session_lost(&e) {
+                // attempt cannot help, and the session may be gone for good.
+                if attempt == config.max_retries || error::is_remote_session_lost(&error) {
                     error!(
                         target: "uploader::chunk",
                         chunk = chunk.index,
-                        error = ?e,
+                        error = ?error,
                         attempt,
-                        "Chunk upload failed after retries"
+                        "Chunk upload failed"
                     );
-                    return Err(e);
+                    return Err(error);
                 }
                 warn!(
                     target: "uploader::chunk",
                     chunk = chunk.index,
-                    error = ?e,
+                    error = ?error,
                     attempt,
                     "Chunk upload failed, will retry"
                 );
@@ -724,5 +257,40 @@ async fn upload_chunk_with_retry(
         }
     }
 
-    Err(anyhow::anyhow!("Chunk upload failed, max retries exceeded"))
+    // The loop always returns on the last attempt; this keeps the signature
+    // total without an unreachable arm inside it.
+    Err(anyhow::anyhow!(
+        "chunk {} upload failed, max retries exceeded",
+        chunk.index
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cloudreve_api::models::explorer::UploadCredential;
+
+    fn session(file_size: u64, chunk_size: i64) -> UploadSession {
+        UploadSession::new(
+            "file:/a".into(),
+            "cloudreve://my/a.bin".into(),
+            file_size,
+            UploadCredential {
+                session_id: "session-1".into(),
+                expires: 4_000_000_000,
+                chunk_size,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn chunk_info_follows_the_session_geometry() {
+        let session = session(12, 5);
+
+        assert_eq!(ChunkInfo::of(&session, 0).offset, 0);
+        assert_eq!(ChunkInfo::of(&session, 0).size, 5);
+        assert_eq!(ChunkInfo::of(&session, 2).offset, 10);
+        assert_eq!(ChunkInfo::of(&session, 2).size, 2);
+    }
 }

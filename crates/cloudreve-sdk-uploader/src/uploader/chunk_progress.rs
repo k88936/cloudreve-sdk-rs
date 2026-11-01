@@ -70,18 +70,9 @@ impl CompletionSet {
         self.records.contains_key(&index)
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.records.len()
-    }
-
-    /// Bytes held by the finished chunks.
-    pub(crate) fn uploaded(&self) -> u64 {
-        self.records.values().map(|record| record.loaded).sum()
-    }
-
-    /// Records in ascending chunk order, as providers that number parts need.
-    pub(crate) fn records(&self) -> impl Iterator<Item = &ChunkProgress> {
-        self.records.values()
+    /// Consume the set into records in ascending chunk order.
+    pub(crate) fn into_vec(self) -> Vec<ChunkProgress> {
+        self.records.into_values().collect()
     }
 }
 
@@ -93,16 +84,18 @@ mod tests {
         ChunkProgress::new(index, loaded, None)
     }
 
+    fn indices(set: CompletionSet) -> Vec<usize> {
+        set.into_vec().iter().map(|record| record.index).collect()
+    }
+
     #[test]
     fn keeps_the_last_record_for_a_retried_chunk() {
-        let set = CompletionSet::new(4, [record(1, 5), record(1, 5), record(2, 3)]);
+        let set = CompletionSet::new(4, [record(1, 5), record(1, 9), record(2, 3)]);
+        let records = set.into_vec();
 
-        assert_eq!(set.len(), 2);
-        assert_eq!(
-            set.records().map(|r| r.index).collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        assert_eq!(set.uploaded(), 8);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].loaded, 9, "the last record must win");
+        assert_eq!(records[1].index, 2);
     }
 
     #[test]
@@ -111,16 +104,13 @@ mod tests {
 
         assert!(set.contains(0));
         assert!(!set.contains(2));
-        assert_eq!(set.len(), 1);
+        assert_eq!(indices(set), vec![0]);
     }
 
     #[test]
     fn records_are_sorted_by_index() {
         let set = CompletionSet::new(5, [record(3, 1), record(0, 1), record(2, 1)]);
 
-        assert_eq!(
-            set.records().map(|r| r.index).collect::<Vec<_>>(),
-            vec![0, 2, 3]
-        );
+        assert_eq!(indices(set), vec![0, 2, 3]);
     }
 }

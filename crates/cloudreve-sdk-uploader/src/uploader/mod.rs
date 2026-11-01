@@ -1,8 +1,12 @@
 //! File uploader implementation for CLI clients.
 //!
 //! This module provides chunked file upload functionality with support for
-//! multiple storage providers, encryption, retries, cancellation, and progress
-//! tracking.
+//! multiple storage providers, encryption and retries.
+//!
+//! An upload is an [`UploadStream`]: `upload` creates the session and returns it
+//! together with the events the upload produces. Consuming the events is what
+//! drives the upload, so a durable log, a progress bar and a resume decision can
+//! all be folds over the same stream.
 
 mod chunk;
 mod chunk_progress;
@@ -10,29 +14,36 @@ mod chunk_progress;
 mod content_uri;
 mod encrypt;
 mod error;
+#[cfg(feature = "progress")]
 mod progress;
 #[allow(dead_code)]
 mod providers;
 #[allow(dead_code)]
 mod session;
 mod source;
+mod stream;
+mod transfer;
 
 use anyhow::{Context, Result};
-pub use chunk_progress::ChunkProgress;
-use chunk_progress::CompletionSet;
-use chunk::ChunkUploader;
-pub use error::{UploadError, UploadResult};
-pub use progress::{ProgressCallback, ProgressUpdate};
-pub use session::UploadSession;
-pub use source::{RangeOpener, SourceReader, UploadSource};
-
-use cloudreve_api::{Client as CrClient, api::ExplorerApi};
-use reqwest::Client as HttpClient;
+use chunk::ChunkInfo;
+use encrypt::EncryptionConfig;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use transfer::{ChunkFuture, ChunkStarter, ChunkTransfer, Finalizer};
+use tracing::{debug, info};
+
+pub use chunk_progress::ChunkProgress;
+pub use error::{UploadError, UploadResult};
+#[cfg(feature = "progress")]
+pub use progress::{ProgressUpdate, Tracker};
+pub use session::UploadSession;
+pub use source::{RangeOpener, SourceReader, UploadSource};
+pub use stream::{UploadEvent, UploadStream};
+
+use cloudreve_api::{Client as CrClient, api::ExplorerApi};
+use reqwest::Client as HttpClient;
 
 /// Configuration for the uploader
 #[derive(Debug, Clone)]
@@ -88,8 +99,6 @@ pub struct Uploader {
     http_client: HttpClient,
     /// Uploader configuration
     config: UploaderConfig,
-    /// Cancellation token for stopping uploads
-    cancel_token: CancellationToken,
 }
 
 impl Uploader {
@@ -104,29 +113,15 @@ impl Uploader {
             cr_client,
             http_client,
             config,
-            cancel_token: CancellationToken::new(),
         }
     }
 
-    /// Create uploader with a custom cancellation token
-    pub fn with_cancel_token(mut self, token: CancellationToken) -> Self {
-        self.cancel_token = token;
-        self
-    }
-
-    /// Upload a file with progress reporting
+    /// Create an upload session and return it with its event stream.
     ///
-    /// This method handles:
-    /// - Creating an upload session
-    /// - Splitting the file into chunks
-    /// - Uploading chunks with retries
-    /// - Reporting progress
-    /// - Completing the upload
-    pub async fn upload<P: ProgressCallback + 'static>(
-        &self,
-        params: UploadParams,
-        progress: P,
-    ) -> Result<()> {
+    /// The session is created before this returns; the chunks are not. Nothing
+    /// is uploaded until the returned stream is polled, and dropping the stream
+    /// cancels the upload.
+    pub async fn upload(&self, params: UploadParams) -> Result<UploadStream> {
         info!(
             target: "uploader",
             source = %params.source.display(),
@@ -135,62 +130,96 @@ impl Uploader {
             "Starting upload"
         );
 
-        // Each upload gets its own cancellation scope. A chunk failure cancels
-        // this child only; reusing the same `Uploader` must not inherit a
-        // cancelled root token from a previous attempt.
-        let upload_token = self.cancel_token.child_token();
-        if upload_token.is_cancelled() {
-            return Err(UploadError::Cancelled.into());
-        }
-
         let session = self.create_session(&params).await?;
-        let chunk_uploader = self.create_chunk_uploader(&session)?;
+        self.start_transfer(session, params.source, Vec::new(), false)
+    }
 
-        let progress = Arc::new(progress);
-        let completed = chunk_uploader
-            .upload_all(&params.source, &session, progress, &upload_token)
-            .await;
+    /// Build the transfer behind [`UploadStream::events`].
+    fn start_transfer(
+        &self,
+        session: UploadSession,
+        source: UploadSource,
+        completed: Vec<ChunkProgress>,
+        resumed: bool,
+    ) -> Result<UploadStream> {
+        let encryption = session
+            .encrypt_metadata
+            .as_ref()
+            .map(EncryptionConfig::from_metadata)
+            .transpose()?;
 
-        match completed {
-            Ok(completed) => {
-                self.complete_upload(&session, &completed).await?;
-                info!(
-                    target: "uploader",
-                    source = %params.source.display(),
-                    "Upload completed successfully"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                error!(
-                    target: "uploader",
-                    source = %params.source.display(),
-                    error = %e,
-                    "Upload failed"
-                );
-                if let Err(e) = self.delete_remote_session(&session).await {
-                    warn!(
+        let policy_type = if session.is_relay() {
+            providers::PolicyType::Local
+        } else {
+            session.policy_type()
+        };
+
+        // Shared by both callbacks: the starter uploads chunks, the finalizer
+        // tells the provider the multipart upload is complete.
+        let shared_session = Arc::new(session.clone());
+
+        let starter: ChunkStarter = {
+            let http_client = self.http_client.clone();
+            let cr_client = Arc::clone(&self.cr_client);
+            let config = self.config.clone();
+            let session = Arc::clone(&shared_session);
+
+            Box::new(move |chunk: ChunkInfo| {
+                let http_client = http_client.clone();
+                let cr_client = Arc::clone(&cr_client);
+                let config = config.clone();
+                let session = Arc::clone(&session);
+                let source = source.clone();
+                let encryption = encryption.clone();
+
+                Box::pin(async move {
+                    let index = chunk.index;
+                    let result = chunk::upload_chunk_with_retry(
+                        &http_client,
+                        &cr_client,
+                        policy_type,
+                        &config,
+                        &source,
+                        &chunk,
+                        encryption,
+                        &session,
+                    )
+                    .await;
+                    (index, result)
+                }) as ChunkFuture
+            })
+        };
+
+        let finalize: Finalizer = {
+            let http_client = self.http_client.clone();
+            let cr_client = Arc::clone(&self.cr_client);
+            let session = Arc::clone(&shared_session);
+
+            Box::new(move |completed: Vec<ChunkProgress>| {
+                let http_client = http_client.clone();
+                let cr_client = Arc::clone(&cr_client);
+                let session = Arc::clone(&session);
+
+                Box::pin(async move {
+                    debug!(
                         target: "uploader",
-                        source = %params.source.display(),
-                        error = %e,
-                        "Failed to delete remote upload session"
+                        session_id = %session.session_id(),
+                        policy_type = ?session.policy_type(),
+                        chunks = completed.len(),
+                        "Completing upload"
                     );
-                }
-                Err(e)
-            }
-        }
-    }
+                    providers::complete_upload(&http_client, &cr_client, &session, &completed)
+                        .await
+                })
+            })
+        };
 
-    /// Cancel the current upload
-    #[allow(dead_code)]
-    pub fn cancel(&self) {
-        self.cancel_token.cancel();
-    }
+        let events = ChunkTransfer::new(session.clone(), completed, resumed, starter, finalize);
 
-    /// Check if upload is cancelled
-    #[allow(dead_code)]
-    pub fn is_cancelled(&self) -> bool {
-        self.cancel_token.is_cancelled()
+        Ok(UploadStream {
+            session,
+            events: events.boxed(),
+        })
     }
 
     /// Create a new upload session via Cloudreve API
@@ -229,42 +258,8 @@ impl Uploader {
         ))
     }
 
-    /// Create appropriate chunk uploader based on policy type
-    fn create_chunk_uploader(&self, session: &UploadSession) -> UploadResult<ChunkUploader> {
-        let policy_type = if session.is_relay() {
-            providers::PolicyType::Local
-        } else {
-            session.policy_type()
-        };
-        let uploader = ChunkUploader::new(
-            self.http_client.clone(),
-            self.cr_client.clone(),
-            policy_type,
-            self.config.clone(),
-        );
-        Ok(uploader)
-    }
-
-    /// Complete the upload (provider-specific finalization)
-    async fn complete_upload(
-        &self,
-        session: &UploadSession,
-        completed: &CompletionSet,
-    ) -> Result<()> {
-        let policy_type = session.policy_type();
-        let records: Vec<ChunkProgress> = completed.records().cloned().collect();
-        debug!(
-            target: "uploader",
-            session_id = %session.session_id(),
-            policy_type = ?policy_type,
-            chunks = records.len(),
-            "Completing upload"
-        );
-
-        providers::complete_upload(&self.http_client, &self.cr_client, session, &records).await
-    }
-
     /// Delete the remote upload session (cancel on server side)
+    #[allow(dead_code)]
     async fn delete_remote_session(&self, session: &UploadSession) -> UploadResult<()> {
         use cloudreve_api::models::explorer::DeleteUploadSessionService;
 
@@ -287,16 +282,10 @@ mod tests {
     use super::*;
     use cloudreve_api::ClientConfig;
 
-    struct NoopProgress;
-
-    impl ProgressCallback for NoopProgress {
-        fn on_progress(&self, _update: ProgressUpdate) {}
-    }
-
     fn params() -> UploadParams {
         UploadParams {
             source: UploadSource::from_bytes([1u8; 4].to_vec()),
-            remote_uri: "cloudreve://my/cancelled.bin".into(),
+            remote_uri: "cloudreve://my/unreachable.bin".into(),
             mime_type: None,
             last_modified: None,
             overwrite: false,
@@ -307,35 +296,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_cancelled_upload_fails_without_network() {
-        let token = CancellationToken::new();
-        token.cancel();
+    async fn session_creation_failure_is_an_error_not_a_stream() {
         let uploader = Uploader::new(
             Arc::new(CrClient::new(ClientConfig::new("http://127.0.0.1:1"))),
             UploaderConfig::default(),
-        )
-        .with_cancel_token(token);
+        );
 
-        let error = uploader.upload(params(), NoopProgress).await.unwrap_err();
+        let error = uploader.upload(params()).await.unwrap_err();
+
         assert!(
-            matches!(
-                error.downcast_ref::<UploadError>(),
-                Some(UploadError::Cancelled)
-            ),
+            format!("{error:#}").contains("upload session"),
             "unexpected error: {error:#}"
         );
-    }
-
-    #[tokio::test]
-    async fn cancelling_a_child_does_not_cancel_the_uploader() {
-        let uploader = Uploader::new(
-            Arc::new(CrClient::new(ClientConfig::new("http://127.0.0.1:1"))),
-            UploaderConfig::default(),
-        );
-        let first = uploader.cancel_token.child_token();
-        first.cancel();
-        assert!(first.is_cancelled());
-        assert!(!uploader.cancel_token.is_cancelled());
-        assert!(!uploader.cancel_token.child_token().is_cancelled());
     }
 }
