@@ -230,6 +230,10 @@ impl Uploader {
             Some(key) => self.load_session(&params, key).await,
             None => None,
         };
+        // A resumed snapshot only stays usable while the server still holds the
+        // session; remember whether this attempt continues an old one and how
+        // far it had progressed.
+        let resumed = loaded.is_some();
         let mut session = match loaded {
             Some(session) => {
                 info!(
@@ -248,6 +252,8 @@ impl Uploader {
                 session
             }
         };
+
+        let completed_before = completed_chunks(&session);
 
         // Create chunk uploader based on policy type
         let chunk_uploader = self.create_chunk_uploader(&session)?;
@@ -312,6 +318,31 @@ impl Uploader {
                     error = %e,
                     "Upload failed"
                 );
+                // A resumed session is only as durable as the server's copy of
+                // it. When the server rejects the session before this attempt
+                // made any progress, the snapshot can never be resumed: drop it
+                // and report an expired session, so the caller starts over with
+                // a fresh one instead of replaying a dead session forever.
+                if resumed
+                    && completed_chunks(&session) == completed_before
+                    && error::is_remote_session_lost(&e)
+                {
+                    warn!(
+                        target: "uploader",
+                        source = %params.source.display(),
+                        "Discarding unusable upload session snapshot"
+                    );
+                    if let (Some(store), Some(key)) = (&self.session_store, &key)
+                        && let Err(error) = store.remove(key).await
+                    {
+                        warn!(
+                            target: "uploader",
+                            error = %error,
+                            "Failed to remove unusable upload session snapshot"
+                        );
+                    }
+                    return Err(UploadError::SessionExpired.into());
+                }
                 if self.session_store.is_some() {
                     warn!(
                         target: "uploader",
@@ -510,6 +541,15 @@ impl Uploader {
 
         Ok(())
     }
+}
+
+/// Number of chunks the session has already uploaded.
+fn completed_chunks(session: &UploadSession) -> usize {
+    session
+        .chunk_progress
+        .iter()
+        .filter(|chunk| chunk.is_complete())
+        .count()
 }
 
 #[cfg(test)]

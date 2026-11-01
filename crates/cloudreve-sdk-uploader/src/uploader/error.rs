@@ -158,3 +158,53 @@ impl From<anyhow::Error> for UploadError {
         UploadError::Other(err.to_string())
     }
 }
+
+/// Whether a failed chunk upload means the server refused the request.
+///
+/// The distinction that matters is "the server answered and rejected this
+/// request" versus "the request never made it": transport failures,
+/// cancellations and token problems leave the snapshot perfectly usable, while
+/// an application error means the server looked at the session and said no.
+/// Cloudreve has no single error code for a vanished session, so the check is
+/// deliberately structural instead of matching specific codes.
+pub(crate) fn is_remote_session_lost(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<cloudreve_api::ApiError>(),
+        Some(
+            cloudreve_api::ApiError::ApiError { .. }
+                | cloudreve_api::ApiError::LockConflict { .. }
+                | cloudreve_api::ApiError::BatchError { .. }
+        )
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api_error(code: i32) -> anyhow::Error {
+        anyhow::anyhow!(cloudreve_api::ApiError::ApiError {
+            code,
+            message: "upload session not found".into(),
+            error_detail: None,
+            correlation_id: None,
+            aggregated_errors: None,
+        })
+    }
+
+    #[test]
+    fn server_rejections_count_as_lost_sessions() {
+        assert!(is_remote_session_lost(&api_error(40004)));
+
+        let contextual = api_error(40004).context("failed to upload chunk");
+        assert!(is_remote_session_lost(&contextual));
+    }
+
+    #[test]
+    fn local_and_transport_failures_do_not() {
+        assert!(!is_remote_session_lost(&anyhow::anyhow!("stream closed")));
+        assert!(!is_remote_session_lost(
+            &anyhow::anyhow!(cloudreve_api::ApiError::Other("boom".into()))
+        ));
+    }
+}
