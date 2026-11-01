@@ -15,6 +15,6 @@ mod uploader;
 pub use uploader::FileSessionStore;
 pub use uploader::{
     ProgressCallback, ProgressUpdate, RangeOpener, SessionKey, SessionStore, SourceReader,
-    UploadError, UploadIdentity, UploadParams, UploadResult, UploadSource, Uploader,
+    UploadError, UploadIdentity, UploadParams, UploadResult, UploadSession, UploadSource, Uploader,
     UploaderConfig,
 };

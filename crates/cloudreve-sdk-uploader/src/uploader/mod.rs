@@ -23,11 +23,11 @@ pub(crate) use chunk::ChunkProgress;
 use chunk::ChunkUploader;
 pub use error::{UploadError, UploadResult};
 pub use progress::{ProgressCallback, ProgressUpdate};
+pub use session::UploadSession;
 pub use session_store::{SessionKey, SessionStore, UploadIdentity};
 #[cfg(feature = "session-store-fs")]
 pub use session_store_fs::FileSessionStore;
 pub use source::{RangeOpener, SourceReader, UploadSource};
-use session::UploadSession;
 
 use cloudreve_api::{Client as CrClient, api::ExplorerApi};
 use reqwest::Client as HttpClient;
