@@ -134,6 +134,41 @@ impl Uploader {
         self.start_transfer(session, params.source, Vec::new(), false)
     }
 
+    /// Continue a session with the chunks that already finished.
+    ///
+    /// `completed` are the records the caller kept, usually read back from a log
+    /// it wrote from a previous [`UploadStream`]. Records are deduplicated (the
+    /// last record per chunk wins) and records outside the session are ignored,
+    /// so a damaged log resumes what it can instead of failing outright.
+    ///
+    /// Nothing compares `source` with the file the records came from: the caller
+    /// must pass the bytes that produced them, or the server will assemble a file
+    /// out of mismatched chunks.
+    ///
+    /// When the server no longer knows the session, the first chunk of the
+    /// attempt is rejected and the stream reports
+    /// [`UploadError::SessionExpired`]; the caller owns the log and should delete
+    /// it.
+    pub async fn try_resume(
+        &self,
+        session: UploadSession,
+        source: UploadSource,
+        completed: impl IntoIterator<Item = ChunkProgress>,
+    ) -> Result<UploadStream> {
+        let completed: Vec<ChunkProgress> = completed.into_iter().collect();
+        info!(
+            target: "uploader",
+            session_id = %session.session_id(),
+            source = %source.display(),
+            file_size = session.file_size,
+            completed_chunks = completed.len(),
+            total_chunks = session.num_chunks(),
+            "Resuming upload"
+        );
+
+        self.start_transfer(session, source, completed, true)
+    }
+
     /// Build the transfer behind [`UploadStream::events`].
     fn start_transfer(
         &self,
@@ -308,5 +343,43 @@ mod tests {
             format!("{error:#}").contains("upload session"),
             "unexpected error: {error:#}"
         );
+    }
+
+    /// A session with `num_chunks` chunks of 5 bytes, reachable without a server.
+    fn session(num_chunks: usize) -> UploadSession {
+        use cloudreve_api::models::explorer::UploadCredential;
+
+        UploadSession::new(
+            "file:/a".into(),
+            "cloudreve://my/a.bin".into(),
+            num_chunks as u64 * 5,
+            UploadCredential {
+                session_id: "session-1".into(),
+                expires: 4_000_000_000,
+                chunk_size: 5,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn try_resume_hands_back_a_lazy_stream() {
+        let uploader = Uploader::new(
+            Arc::new(CrClient::new(ClientConfig::new("http://127.0.0.1:1"))),
+            UploaderConfig::default(),
+        );
+        let session = session(4);
+
+        let stream = uploader
+            .try_resume(
+                session.clone(),
+                UploadSource::from_bytes(vec![0u8; 20]),
+                [ChunkProgress::new(0, 5, None)],
+            )
+            .await
+            .expect("resuming must not touch the network");
+
+        assert_eq!(stream.session.session_id(), session.session_id());
+        assert_eq!(stream.session.num_chunks(), 4);
     }
 }
