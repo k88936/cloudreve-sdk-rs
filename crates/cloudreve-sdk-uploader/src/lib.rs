@@ -11,10 +11,7 @@ extern crate cloudreve_sdk_api as cloudreve_api;
 #[rustfmt::skip]
 mod uploader;
 
-#[cfg(feature = "session-store-fs")]
-pub use uploader::FileSessionStore;
 pub use uploader::{
-    ProgressCallback, ProgressUpdate, RangeOpener, SNAPSHOT_VERSION, SessionKey, SessionStore,
-    Snapshot, SourceReader, UploadError, UploadIdentity, UploadParams, UploadResult, UploadSession,
-    UploadSource, Uploader, UploaderConfig, decode_snapshot, encode_snapshot,
+    ChunkProgress, ProgressCallback, ProgressUpdate, RangeOpener, SourceReader, UploadError,
+    UploadParams, UploadResult, UploadSession, UploadSource, Uploader, UploaderConfig,
 };

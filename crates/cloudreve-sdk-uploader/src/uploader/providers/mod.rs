@@ -7,6 +7,7 @@ mod s3;
 mod upyun;
 
 use crate::uploader::chunk::ChunkInfo;
+use crate::uploader::chunk_progress::ChunkProgress;
 use crate::uploader::session::UploadSession;
 use anyhow::Result;
 use bytes::Bytes;
@@ -116,8 +117,8 @@ impl PolicyType {
     }
 }
 
-/// Upload a chunk to the appropriate provider using streaming with progress tracking
-pub async fn upload_chunk_with_progress<S>(
+/// Upload a chunk to the appropriate provider using streaming
+pub async fn upload_chunk<S>(
     http_client: &HttpClient,
     cr_client: &Arc<CrClient>,
     policy_type: PolicyType,
@@ -151,6 +152,7 @@ pub async fn complete_upload(
     http_client: &HttpClient,
     cr_client: &Arc<CrClient>,
     session: &UploadSession,
+    completed: &[ChunkProgress],
 ) -> Result<()> {
     let policy_type = if session.is_relay() {
         PolicyType::Local
@@ -165,20 +167,20 @@ pub async fn complete_upload(
         }
         PolicyType::Oss => s3::complete_upload_oss(http_client, session).await,
         PolicyType::Cos => {
-            s3::complete_upload_s3like(http_client, session).await?;
+            s3::complete_upload_s3like(http_client, session, completed).await?;
             s3::callback_s3like(cr_client, session, "cos").await
         }
         PolicyType::S3 => {
-            s3::complete_upload_s3like(http_client, session).await?;
+            s3::complete_upload_s3like(http_client, session, completed).await?;
             s3::callback_s3like(cr_client, session, "s3").await
         }
         PolicyType::Ks3 => {
-            s3::complete_upload_s3like(http_client, session).await?;
+            s3::complete_upload_s3like(http_client, session, completed).await?;
             s3::callback_s3like(cr_client, session, "ks3").await
         }
-        PolicyType::Obs => s3::complete_upload_obs(http_client, session).await,
+        PolicyType::Obs => s3::complete_upload_obs(http_client, session, completed).await,
         PolicyType::OneDrive => onedrive::complete_upload(cr_client, session).await,
-        PolicyType::Qiniu => qiniu::complete_upload(http_client, session).await,
+        PolicyType::Qiniu => qiniu::complete_upload(http_client, session, completed).await,
         PolicyType::Upyun => {
             // Sleep 10s for a callback
             tokio::time::sleep(Duration::from_secs(10)).await;

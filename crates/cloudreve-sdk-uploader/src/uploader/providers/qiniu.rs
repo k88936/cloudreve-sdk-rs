@@ -1,6 +1,7 @@
 //! Qiniu Cloud Storage upload implementation
 
 use crate::uploader::chunk::ChunkInfo;
+use crate::uploader::chunk_progress::ChunkProgress;
 use crate::uploader::session::UploadSession;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -105,7 +106,11 @@ where
 }
 
 /// Complete Qiniu multipart upload
-pub async fn complete_upload(http_client: &HttpClient, session: &UploadSession) -> Result<()> {
+pub async fn complete_upload(
+    http_client: &HttpClient,
+    session: &UploadSession,
+    completed: &[ChunkProgress],
+) -> Result<()> {
     let url = session
         .upload_url()
         .context("no upload URL for Qiniu completion")?;
@@ -113,8 +118,7 @@ pub async fn complete_upload(http_client: &HttpClient, session: &UploadSession) 
     let credential = session.credential_string();
 
     // Build completion request
-    let parts: Vec<QiniuPartInfo> = session
-        .chunk_progress
+    let parts: Vec<QiniuPartInfo> = completed
         .iter()
         .filter_map(|c| {
             c.etag.as_ref().map(|etag| QiniuPartInfo {

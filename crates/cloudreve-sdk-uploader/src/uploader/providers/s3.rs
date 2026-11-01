@@ -2,7 +2,8 @@
 //!
 //! Supports: OSS, COS, S3, KS3, OBS
 
-use crate::uploader::chunk::{ChunkInfo, ChunkProgress};
+use crate::uploader::chunk::ChunkInfo;
+use crate::uploader::chunk_progress::ChunkProgress;
 use crate::uploader::session::UploadSession;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -146,9 +147,10 @@ pub async fn complete_upload_oss(http_client: &HttpClient, session: &UploadSessi
 pub async fn complete_upload_s3like(
     http_client: &HttpClient,
     session: &UploadSession,
+    completed: &[ChunkProgress],
 ) -> Result<()> {
     let url = session.complete_url();
-    let body = build_complete_multipart_xml(&session.chunk_progress);
+    let body = build_complete_multipart_xml(completed);
 
     debug!(
         target: "uploader::s3",
@@ -184,9 +186,13 @@ pub async fn complete_upload_s3like(
 }
 
 /// Complete multipart upload for OBS
-pub async fn complete_upload_obs(http_client: &HttpClient, session: &UploadSession) -> Result<()> {
+pub async fn complete_upload_obs(
+    http_client: &HttpClient,
+    session: &UploadSession,
+    completed: &[ChunkProgress],
+) -> Result<()> {
     let url = session.complete_url();
-    let body = build_complete_multipart_xml(&session.chunk_progress);
+    let body = build_complete_multipart_xml(completed);
 
     debug!(
         target: "uploader::s3",

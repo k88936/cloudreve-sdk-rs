@@ -1,19 +1,18 @@
 //! Chunk-based upload logic with streaming support and progress tracking
 
 use crate::uploader::UploaderConfig;
+use crate::uploader::chunk_progress::{ChunkProgress, CompletionSet};
 use crate::uploader::encrypt::EncryptionConfig;
-use crate::uploader::error::UploadError;
+use crate::uploader::error::{self, UploadError};
 use crate::uploader::progress::{ProgressCallback, ProgressTracker};
 use crate::uploader::providers::{self, PolicyType};
 use crate::uploader::session::UploadSession;
-use crate::uploader::session_store::{SessionKey, SessionStore};
 use crate::uploader::source::{SourceReader, UploadSource};
 use anyhow::Result;
 use bytes::Bytes;
 use cloudreve_api::Client as CrClient;
 use futures::Stream;
 use reqwest::Client as HttpClient;
-use serde::{Deserialize, Serialize};
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,33 +24,6 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-
-/// Per-chunk progress tracking
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkProgress {
-    /// Chunk index
-    pub index: usize,
-    /// Bytes uploaded for this chunk
-    pub loaded: u64,
-    /// ETag returned by storage provider (for S3-like providers)
-    pub etag: Option<String>,
-}
-
-impl ChunkProgress {
-    /// Create a new chunk progress entry
-    pub fn new(index: usize) -> Self {
-        Self {
-            index,
-            loaded: 0,
-            etag: None,
-        }
-    }
-
-    /// Check if chunk upload is complete
-    pub fn is_complete(&self) -> bool {
-        self.loaded > 0
-    }
-}
 
 /// Metadata about a single chunk (without the data)
 #[derive(Debug, Clone)]
@@ -248,25 +220,6 @@ where
     }
 }
 
-/// Snapshot writer used after every completed chunk.
-#[derive(Clone)]
-pub(crate) struct SessionPersistence {
-    pub store: Arc<dyn SessionStore>,
-    pub key: SessionKey,
-}
-
-impl SessionPersistence {
-    async fn save(&self, session: &UploadSession) {
-        if let Err(error) = self.store.save(&self.key, session).await {
-            warn!(
-                target: "uploader::chunk",
-                error = %error,
-                "Failed to persist upload session; continuing in memory"
-            );
-        }
-    }
-}
-
 /// Chunk uploader that handles uploading chunks to different providers
 pub struct ChunkUploader {
     http_client: HttpClient,
@@ -298,17 +251,17 @@ impl ChunkUploader {
     pub async fn upload_all<P: ProgressCallback + 'static>(
         &self,
         source: &UploadSource,
-        session: &mut UploadSession,
+        session: &UploadSession,
         progress_callback: Arc<P>,
         cancel_token: &CancellationToken,
-        persistence: Option<SessionPersistence>,
-    ) -> Result<()> {
+    ) -> Result<CompletionSet> {
         let concurrency = session.chunk_concurrency();
+        let num_chunks = session.num_chunks();
 
         info!(
             target: "uploader::chunk",
             source = %source.display(),
-            num_chunks = session.num_chunks(),
+            num_chunks = num_chunks,
             policy_type = ?self.policy_type,
             concurrency = concurrency,
             "Starting chunk upload"
@@ -325,32 +278,10 @@ impl ChunkUploader {
             return Err(UploadError::Cancelled.into());
         }
 
-        // Get pending chunks
-        let pending_chunks = session.pending_chunks();
-        if pending_chunks.is_empty() {
-            info!(
-                target: "uploader::chunk",
-                "All chunks already uploaded"
-            );
-            return Ok(());
-        }
-
-        info!(
-            target: "uploader::chunk",
-            pending = pending_chunks.len(),
-            total = session.num_chunks(),
-            concurrency = concurrency,
-            "Uploading pending chunks"
-        );
+        let pending_chunks: Vec<usize> = (0..num_chunks).collect();
 
         // Create progress tracker
-        let tracker = ProgressTracker::new(session.file_size, session.num_chunks());
-
-        // Initialize tracker with already completed chunks
-        for chunk in session.chunk_progress.iter().filter(|c| c.is_complete()) {
-            tracker.add_bytes(chunk.loaded);
-            tracker.complete_chunk();
-        }
+        let tracker = ProgressTracker::new(session.file_size, num_chunks);
 
         // Spawn progress reporter task
         let reporter_tracker = Arc::clone(&tracker);
@@ -381,7 +312,6 @@ impl ChunkUploader {
                 &tracker,
                 cancel_token,
                 concurrency,
-                persistence,
             )
             .await;
 
@@ -405,14 +335,13 @@ impl ChunkUploader {
     async fn upload_chunks_with_pool(
         &self,
         source: &UploadSource,
-        session: &mut UploadSession,
+        session: &UploadSession,
         pending_chunks: &[usize],
         encryption: Option<EncryptionConfig>,
         tracker: &Arc<ProgressTracker>,
         cancel_token: &CancellationToken,
         concurrency: usize,
-        persistence: Option<SessionPersistence>,
-    ) -> Result<()> {
+    ) -> Result<CompletionSet> {
         // Prepare chunk infos for pending chunks
         let chunk_infos: Vec<ChunkInfo> = pending_chunks
             .iter()
@@ -429,11 +358,11 @@ impl ChunkUploader {
         // Shared state for the dynamic pool
         let pool_state = Arc::new(UploadPoolState::new(chunk_infos));
 
-        // Shared progress state (protected by mutex)
-        let progress_state = Arc::new(Mutex::new(ChunkProgressState {
-            chunk_progress: session.chunk_progress.clone(),
-            updated_at: session.updated_at,
-        }));
+        // Shared completion records (protected by mutex)
+        let completed = Arc::new(Mutex::new(CompletionSet::new(
+            session.num_chunks(),
+            Vec::new(),
+        )));
 
         // The source is cheap to clone (Arc) and owns no mutable state.
         let source = source.clone();
@@ -451,9 +380,8 @@ impl ChunkUploader {
                     Arc::clone(tracker),
                     cancel_token.clone(),
                     Arc::clone(&pool_state),
-                    Arc::clone(&progress_state),
+                    Arc::clone(&completed),
                     Arc::clone(&shared_session),
-                    persistence.clone(),
                 );
                 handles.push(handle);
             }
@@ -467,12 +395,11 @@ impl ChunkUploader {
         // Wait for any dynamically spawned workers to complete
         pool_state.wait_for_completion().await;
 
-        // Update the session with final progress
-        {
-            let final_state = progress_state.lock().await;
-            session.chunk_progress = final_state.chunk_progress.clone();
-            session.updated_at = final_state.updated_at;
-        }
+        // Every worker is done, so the shared set can be unwrapped without waiting.
+        let completed = match Arc::try_unwrap(completed) {
+            Ok(completed) => completed.into_inner(),
+            Err(shared) => shared.lock().await.clone(),
+        };
 
         // Check if there was an error
         if let Some(error_msg) = pool_state.get_error() {
@@ -489,16 +416,21 @@ impl ChunkUploader {
         if cancel_token.is_cancelled() {
             return Err(UploadError::Cancelled.into());
         }
-        if !session.all_chunks_complete() {
-            return Err(anyhow::anyhow!("upload ended with pending chunks"));
+        if completed.len() != session.num_chunks() {
+            let missing = (0..session.num_chunks()).find(|index| !completed.contains(*index));
+            return Err(anyhow::anyhow!(
+                "upload ended with chunk {:?} pending",
+                missing
+            ));
         }
 
         info!(
             target: "uploader::chunk",
+            uploaded_bytes = completed.uploaded(),
             "All chunks uploaded successfully"
         );
 
-        Ok(())
+        Ok(completed)
     }
 
     /// Spawn a worker task to upload chunks from the pool
@@ -511,9 +443,8 @@ impl ChunkUploader {
         tracker: Arc<ProgressTracker>,
         cancel_token: CancellationToken,
         pool_state: Arc<UploadPoolState>,
-        progress_state: Arc<Mutex<ChunkProgressState>>,
+        completed: Arc<Mutex<CompletionSet>>,
         session: Arc<UploadSession>,
-        persistence: Option<SessionPersistence>,
     ) -> tokio::task::JoinHandle<()> {
         let http_client = self.http_client.clone();
         let cr_client = Arc::clone(&self.cr_client);
@@ -560,24 +491,12 @@ impl ChunkUploader {
                     Ok(etag) => {
                         tracker.complete_chunk();
 
-                        // Update progress state, then persist a durable
-                        // snapshot so a restart can skip this chunk.
-                        let snapshot = {
-                            let mut state = progress_state.lock().await;
-                            let chunk_size = chunk.size;
-                            if chunk_index < state.chunk_progress.len() {
-                                state.chunk_progress[chunk_index].loaded = chunk_size;
-                                state.chunk_progress[chunk_index].etag = etag;
-                                state.updated_at = chrono::Utc::now().timestamp();
-                            }
-                            let mut snapshot = session.as_ref().clone();
-                            snapshot.chunk_progress = state.chunk_progress.clone();
-                            snapshot.updated_at = state.updated_at;
-                            snapshot
-                        };
-                        if let Some(persistence) = &persistence {
-                            persistence.save(&snapshot).await;
-                        }
+                        // Record the chunk before taking the next one: the
+                        // record is what a resumed upload replays.
+                        completed
+                            .lock()
+                            .await
+                            .insert(ChunkProgress::new(chunk_index, chunk.size, etag));
 
                         debug!(
                             target: "uploader::chunk",
@@ -613,13 +532,6 @@ impl ChunkUploader {
 // =========================================================================
 // Upload Pool Support Types
 // =========================================================================
-
-/// Chunk progress state for uploads (protected by mutex)
-#[derive(Debug, Clone)]
-struct ChunkProgressState {
-    chunk_progress: Vec<ChunkProgress>,
-    updated_at: i64,
-}
 
 /// State management for chunk uploads with dynamic worker pool
 struct UploadPoolState {
@@ -765,7 +677,7 @@ async fn upload_chunk_with_retry(
         // Capture bytes counter before stream is consumed
         let bytes_sent_counter = progress_stream.bytes_sent_counter();
 
-        match providers::upload_chunk_with_progress(
+        match providers::upload_chunk(
             http_client,
             cr_client,
             policy_type,
@@ -788,7 +700,10 @@ async fn upload_chunk_with_retry(
                 // Use the captured counter to get bytes sent after stream was consumed
                 let bytes_sent = bytes_sent_counter.load(Ordering::SeqCst);
                 tracker.reset_chunk_bytes(bytes_sent);
-                if attempt == config.max_retries {
+                // The server answered and rejected the request: another
+                // attempt (or another session) is what could help, not another
+                // retry of the same one.
+                if attempt == config.max_retries || error::is_remote_session_lost(&e) {
                     error!(
                         target: "uploader::chunk",
                         chunk = chunk.index,

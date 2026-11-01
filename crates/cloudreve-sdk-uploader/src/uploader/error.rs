@@ -163,8 +163,9 @@ impl From<anyhow::Error> for UploadError {
 ///
 /// The distinction that matters is "the server answered and rejected this
 /// request" versus "the request never made it": transport failures,
-/// cancellations and token problems leave the snapshot perfectly usable, while
-/// an application error means the server looked at the session and said no.
+/// cancellations and token problems are worth retrying, while an application
+/// error means the server looked at the session and said no, so retrying the
+/// same request cannot help and the session may be gone for good.
 /// Cloudreve has no single error code for a vanished session, so the check is
 /// deliberately structural instead of matching specific codes.
 pub(crate) fn is_remote_session_lost(error: &anyhow::Error) -> bool {
