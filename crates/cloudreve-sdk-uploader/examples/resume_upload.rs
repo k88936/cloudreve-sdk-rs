@@ -185,15 +185,19 @@ async fn main() -> Result<()> {
     if phase != "second" {
         let _ = std::fs::remove_dir_all(&session_dir);
         std::fs::create_dir_all(&session_dir)?;
-        let config = UploaderConfig {
-            max_retries: 0,
-            ..Default::default()
-        }
-        .with_session_dir(&session_dir);
+    }
 
-        let result = Uploader::new(Arc::clone(&client), config)
-            .upload(params.clone(), NoopProgress)
-            .await;
+    let config = UploaderConfig {
+        max_retries: 0,
+        ..Default::default()
+    }
+    .with_session_dir(&session_dir);
+    // In `all` mode the same Uploader is reused after the injected chunk
+    // failure, reproducing the "cancelled root token" regression.
+    let uploader = Uploader::new(Arc::clone(&client), config);
+
+    if phase != "second" {
+        let result = uploader.upload(params.clone(), NoopProgress).await;
         let Err(error) = result else {
             bail!("first attempt unexpectedly succeeded; increase CLOUDREVE_RESUME_MB");
         };
@@ -219,10 +223,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let config = UploaderConfig::default().with_session_dir(&session_dir);
-    Uploader::new(Arc::clone(&client), config)
-        .upload(params, NoopProgress)
-        .await?;
+    uploader.upload(params, NoopProgress).await?;
 
     let snapshots = snapshot_count(&session_dir)?;
     if snapshots != 0 {

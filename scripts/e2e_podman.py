@@ -216,6 +216,33 @@ def main() -> None:
     )
     shutil.rmtree(resume_dir, ignore_errors=True)
 
+    print(
+        "Running resumable chunk upload example (same Uploader reused after failure)",
+        flush=True,
+    )
+    reuse_dir = REPOSITORY / "target" / f"resume-reuse-e2e-{os.getpid()}"
+    shutil.rmtree(reuse_dir, ignore_errors=True)
+    subprocess.run(
+        (
+            "cargo",
+            "run",
+            "--quiet",
+            "-p",
+            "cloudreve-sdk-uploader",
+            "--example",
+            "resume_upload",
+        ),
+        cwd=REPOSITORY,
+        env={
+            **resume_environment,
+            "CLOUDREVE_RESUME_DIR": str(reuse_dir),
+            "CLOUDREVE_RESUME_NAME": "cloudreve-sdk-reuse-e2e.bin",
+            "CLOUDREVE_RESUME_PHASE": "all",
+        },
+        check=True,
+    )
+    shutil.rmtree(reuse_dir, ignore_errors=True)
+
     print("Running share-link CRUD example", flush=True)
     subprocess.run(
         (

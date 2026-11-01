@@ -208,6 +208,14 @@ impl Uploader {
             "Starting upload"
         );
 
+        // Each upload gets its own cancellation scope. A chunk failure cancels
+        // this child only; reusing the same `Uploader` must not inherit a
+        // cancelled root token from a previous attempt.
+        let upload_token = self.cancel_token.child_token();
+        if upload_token.is_cancelled() {
+            return Err(UploadError::Cancelled.into());
+        }
+
         // Without a store there is no snapshot key to compute; skipping it also
         // avoids hashing an in-memory source when resume is disabled.
         let key = self
@@ -254,10 +262,24 @@ impl Uploader {
                 &params.source,
                 &mut session,
                 progress,
-                &self.cancel_token,
+                &upload_token,
                 persistence,
             )
             .await;
+
+        // A cancelled worker can return without setting an error; never let a
+        // partial upload reach `complete_upload` and be reported as success.
+        let result = match result {
+            Ok(()) if !session.all_chunks_complete() => {
+                let chunk_index = session.pending_chunks().first().copied().unwrap_or(0);
+                Err(UploadError::ChunkUploadFailed {
+                    chunk_index,
+                    message: "upload ended with pending chunks".into(),
+                }
+                .into())
+            }
+            other => other,
+        };
 
         match result {
             Ok(()) => {
@@ -483,5 +505,63 @@ impl Uploader {
             .map_err(|e| UploadError::SessionDeletionFailed(e.to_string()))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cloudreve_api::ClientConfig;
+
+    struct NoopProgress;
+
+    impl ProgressCallback for NoopProgress {
+        fn on_progress(&self, _update: ProgressUpdate) {}
+    }
+
+    fn params() -> UploadParams {
+        UploadParams {
+            source: UploadSource::from_bytes([1u8; 4].to_vec()),
+            remote_uri: "cloudreve://my/cancelled.bin".into(),
+            mime_type: None,
+            last_modified: None,
+            overwrite: false,
+            policy_id: String::new(),
+            metadata: None,
+            previous_version: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_upload_fails_without_network() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let uploader = Uploader::new(
+            Arc::new(CrClient::new(ClientConfig::new("http://127.0.0.1:1"))),
+            UploaderConfig::default(),
+        )
+        .with_cancel_token(token);
+
+        let error = uploader.upload(params(), NoopProgress).await.unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<UploadError>(),
+                Some(UploadError::Cancelled)
+            ),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_child_does_not_cancel_the_uploader() {
+        let uploader = Uploader::new(
+            Arc::new(CrClient::new(ClientConfig::new("http://127.0.0.1:1"))),
+            UploaderConfig::default(),
+        );
+        let first = uploader.cancel_token.child_token();
+        first.cancel();
+        assert!(first.is_cancelled());
+        assert!(!uploader.cancel_token.is_cancelled());
+        assert!(!uploader.cancel_token.child_token().is_cancelled());
     }
 }

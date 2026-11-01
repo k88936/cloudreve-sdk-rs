@@ -321,6 +321,10 @@ impl ChunkUploader {
             .map(EncryptionConfig::from_metadata)
             .transpose()?;
 
+        if cancel_token.is_cancelled() {
+            return Err(UploadError::Cancelled.into());
+        }
+
         // Get pending chunks
         let pending_chunks = session.pending_chunks();
         if pending_chunks.is_empty() {
@@ -478,6 +482,15 @@ impl ChunkUploader {
                 "Upload failed"
             );
             return Err(anyhow::anyhow!("Upload failed: {}", error_msg));
+        }
+
+        // Workers stop silently once cancellation is observed. Treat that as a
+        // cancellation/partial upload instead of reporting success.
+        if cancel_token.is_cancelled() {
+            return Err(UploadError::Cancelled.into());
+        }
+        if !session.all_chunks_complete() {
+            return Err(anyhow::anyhow!("upload ended with pending chunks"));
         }
 
         info!(
