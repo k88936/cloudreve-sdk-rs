@@ -60,6 +60,18 @@ def wait_until_ready(server: str) -> None:
     raise TimeoutError(f"Cloudreve did not become ready: {last_error}")
 
 
+def image_available(image: str) -> bool:
+    return (
+        subprocess.run(
+            ("podman", "image", "exists", image),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
 def remove_container() -> None:
     if shutil.which("podman") is None:
         return
@@ -80,8 +92,11 @@ def main() -> None:
         if shutil.which(command) is None:
             raise RuntimeError(f"required command not found: {command}")
 
-    print(f"Pulling Cloudreve image {IMAGE}", flush=True)
-    run("podman", "pull", IMAGE)
+    if image_available(IMAGE):
+        print(f"Reusing the local Cloudreve image {IMAGE}", flush=True)
+    else:
+        print(f"Pulling Cloudreve image {IMAGE}", flush=True)
+        run("podman", "pull", IMAGE)
 
     print(f"Starting ephemeral Cloudreve container from {IMAGE}", flush=True)
     run(
