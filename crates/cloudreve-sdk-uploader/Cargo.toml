@@ -1,6 +1,6 @@
 [package]
 name = "cloudreve-sdk-uploader"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Provider-aware chunked file uploads for Cloudreve CLI clients"
 license = "MIT"
@@ -18,7 +18,7 @@ anyhow = "1.0"
 base64 = "0.22"
 bytes = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
-cloudreve-sdk-api = { version = "0.1.0", path = "../cloudreve-sdk-api" }
+cloudreve-sdk-api = { version = "0.1.1", path = "../cloudreve-sdk-api" }
 ctr = "0.9"
 futures = "0.3"
 sha2 = "0.10"
