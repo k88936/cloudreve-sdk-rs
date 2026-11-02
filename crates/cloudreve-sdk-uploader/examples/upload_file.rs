@@ -1,60 +1,46 @@
-//! Minimal upload: create a session, consume the event stream, print progress.
+//! Minimal upload: create a session, consume the event stream, print progress,
+//! then download the result back and compare its hash.
 //!
 //! Usage: `upload_file <LOCAL_PATH> <REMOTE_FILE_URI>`
 //!
 //! Needs `CLOUDREVE_SERVER`, `CLOUDREVE_EMAIL` and `CLOUDREVE_PASSWORD`.
 
-use cloudreve_sdk_api::api::UserApi;
-use cloudreve_sdk_api::{Client, ClientConfig};
-use cloudreve_sdk_uploader::{
-    Tracker, UploadEvent, UploadParams, UploadSource, Uploader, UploaderConfig,
-};
-use futures::StreamExt;
-use std::env;
-use std::error::Error;
-use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let mut args = env::args().skip(1);
-    let local_path = args.next().map(PathBuf::from).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: upload_file <LOCAL_PATH> <REMOTE_FILE_URI>",
-        )
-    })?;
-    let remote_uri = args.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: upload_file <LOCAL_PATH> <REMOTE_FILE_URI>",
-        )
-    })?;
+use anyhow::{Result, bail};
+use cloudreve_sdk_uploader::{Tracker, UploadParams, UploadSource, Uploader, UploaderConfig};
 
+#[path = "example_utils/mod.rs"]
+mod example_utils;
+
+use example_utils::download::{digest_file, verify};
+use example_utils::drain::{Outcome, drain};
+use example_utils::env::Settings;
+use example_utils::login::login;
+
+const USAGE: &str = "usage: upload_file <LOCAL_PATH> <REMOTE_FILE_URI>";
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    let (Some(local_path), Some(remote_uri)) = (args.next(), args.next()) else {
+        bail!(USAGE);
+    };
     if args.next().is_some() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "too many arguments").into());
+        bail!("too many arguments\n{USAGE}");
     }
 
-    let server = env::var("CLOUDREVE_SERVER")?;
-    let email = env::var("CLOUDREVE_EMAIL")?;
-    let password = env::var("CLOUDREVE_PASSWORD")?;
+    let settings = Settings::from_env()?;
+    let (client, _) = login(&settings, "cloudreve-sdk-uploader-example").await?;
+    let client = Arc::new(client);
 
-    let client = Arc::new(Client::new(
-        ClientConfig::new(server)
-            .with_timeout(60)
-            .with_user_agent("cloudreve-sdk-uploader-example"),
-    ));
-
-    let login = client.login(&email, &password).await?;
-    client.set_tokens_with_expiry(&login.token).await?;
-
+    let local_path = PathBuf::from(local_path);
     let metadata = tokio::fs::metadata(&local_path).await?;
     if !metadata.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path is not a file").into());
+        bail!("{} is not a file", local_path.display());
     }
-
     let last_modified = metadata
         .modified()
         .ok()
@@ -65,7 +51,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let stream = uploader
         .upload(UploadParams {
             source: UploadSource::from_path(&local_path)?,
-            remote_uri,
+            remote_uri: remote_uri.clone(),
             mime_type: None,
             last_modified,
             overwrite: false,
@@ -75,13 +61,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })
         .await?;
 
-    // Progress is a fold over the events, not a callback: one loop feeds the
-    // tracker and handles the outcome.
+    // Progress is a fold over the events, not a callback: the shared drain loop
+    // hands every finished chunk to this closure, which only formats it.
     let mut tracker = Tracker::new(&stream.session, &[]);
-    let mut events = stream.events;
-
-    while let Some(event) = events.next().await {
-        if let Some(update) = tracker.observe(&event) {
+    let outcome = drain(stream, |event| {
+        if let Some(update) = tracker.observe(event) {
             eprintln!(
                 "{:.1}% ({}/{}) at {} bytes/s, chunks {}/{}",
                 update.progress * 100.0,
@@ -92,20 +76,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 update.total_chunks,
             );
         }
+        Ok(())
+    })
+    .await?;
 
-        match event {
-            UploadEvent::Completed => {
-                println!("Upload completed");
-                return Ok(());
-            }
-            UploadEvent::Failed(error) => return Err(error.into()),
-            UploadEvent::ChunkDone(_) => {}
-        }
+    match outcome {
+        Outcome::Completed => {}
+        Outcome::Failed(error) => bail!("upload failed: {error}"),
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::UnexpectedEof,
-        "upload stream ended without a terminal event",
-    )
-    .into())
+    println!("Upload completed; checking the stored bytes");
+    let expected = digest_file(&local_path).await?;
+    verify(&client, &settings.server, &remote_uri, expected).await?;
+    println!("downloaded content hash matches");
+
+    Ok(())
 }

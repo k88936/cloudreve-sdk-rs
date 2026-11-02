@@ -1,31 +1,23 @@
-use cloudreve_sdk_api::api::{ExplorerApi, UserApi};
+use anyhow::Result;
+use cloudreve_sdk_api::api::ExplorerApi;
 use cloudreve_sdk_api::models::explorer::ListFileService;
-use cloudreve_sdk_api::{Client, ClientConfig};
-use std::env;
-use std::error::Error;
+
+#[path = "example_utils/mod.rs"]
+mod example_utils;
+
+use example_utils::env::Settings;
+use example_utils::login::login;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let server = env::var("CLOUDREVE_SERVER")?;
-    let email = env::var("CLOUDREVE_EMAIL")?;
-    let password = env::var("CLOUDREVE_PASSWORD")?;
-    let remote_uri =
-        env::var("CLOUDREVE_URI").unwrap_or_else(|_| "cloudreve://my/".to_string());
+async fn main() -> Result<()> {
+    let settings = Settings::from_env()?;
+    let (client, account) = login(&settings, "cloudreve-sdk-api-example").await?;
 
-    let client = Client::new(
-        ClientConfig::new(server)
-            .with_timeout(60)
-            .with_user_agent("cloudreve-sdk-api-example"),
-    );
-
-    let login = client.login(&email, &password).await?;
-    client.set_tokens_with_expiry(&login.token).await?;
-
-    println!("Logged in as {}", login.user.nickname);
+    println!("Logged in as {}", account.user.nickname);
 
     let response = client
         .list_files(&ListFileService {
-            uri: remote_uri,
+            uri: settings.root.clone(),
             page: None,
             page_size: Some(50),
             order_by: Some("name".to_string()),

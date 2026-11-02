@@ -32,9 +32,9 @@ Progress is a fold over those events: the `Tracker` (behind the default-on `prog
 feature) borrows each event and yields a `ProgressUpdate`, so a single loop can print
 progress and persist the finished chunks at the same time.
 
-The runnable example logs in, creates an uploader, and uploads one file while printing
-progress. The remote argument must be a complete Cloudreve file URI, including the
-destination filename.
+The runnable example logs in, creates an uploader, uploads one file while printing
+progress, then downloads it back and compares the SHA-256. The remote argument must be a
+complete Cloudreve file URI, including the destination filename.
 
 ```bash
 export CLOUDREVE_SERVER="https://cloudreve.example"

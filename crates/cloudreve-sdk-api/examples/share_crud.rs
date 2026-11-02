@@ -1,24 +1,27 @@
 //! Live share-link CRUD smoke test. Run through `scripts/e2e_podman.py`.
 
-use cloudreve_sdk_api::api::{ExplorerApi, ShareApi, UserApi};
+use anyhow::{anyhow, bail, Result};
+use cloudreve_sdk_api::api::{ExplorerApi, ShareApi};
 use cloudreve_sdk_api::models::explorer::CreateFileService;
 use cloudreve_sdk_api::client::RequestOptions;
 use cloudreve_sdk_api::models::share::{ListShareService, ShareCreateService};
-use cloudreve_sdk_api::{Client, ClientConfig};
-use std::error::Error;
+
+#[path = "example_utils/mod.rs"]
+mod example_utils;
+
+use example_utils::env::Settings;
+use example_utils::login::{anonymous, login};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let server = std::env::var("CLOUDREVE_SERVER")?;
-    let email = std::env::var("CLOUDREVE_EMAIL")?;
-    let password = std::env::var("CLOUDREVE_PASSWORD")?;
-    let root = std::env::var("CLOUDREVE_URI").unwrap_or_else(|_| "cloudreve://my/".into());
+async fn main() -> Result<()> {
+    let settings = Settings::from_env()?;
+    let (client, _) = login(&settings, "cloudreve-sdk-api-example").await?;
 
-    let client = Client::new(ClientConfig::new(&server));
-    let login = client.login(&email, &password).await?;
-    client.set_tokens_with_expiry(&login.token).await?;
-
-    let folder_uri = format!("{}/share-e2e-{}", root.trim_end_matches('/'), std::process::id());
+    let folder_uri = format!(
+        "{}/share-e2e-{}",
+        settings.root.trim_end_matches('/'),
+        std::process::id()
+    );
     let folder = client
         .create_file(&CreateFileService {
             uri: folder_uri.clone(),
@@ -36,17 +39,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     create.share_view = true;
     let url = client.create_share(&create).await?;
     if url.is_empty() {
-        return Err("create_share returned an empty URL".into());
+        bail!("create_share returned an empty URL");
     }
     println!("created share URL: {url}");
     let first_id = share_id_from_url(&url)?;
 
     let info = client.get_share(&first_id, Some("firstpass"), false, false).await?;
     if !info.password_protected || !info.unlocked {
-        return Err(format!("unexpected share info: {info:?}").into());
+        bail!("unexpected share info: {info:?}");
     }
     if !info.url.contains(&first_id) {
-        return Err("share URL does not contain its id".into());
+        bail!("share URL does not contain its id");
     }
 
     let list = client
@@ -56,12 +59,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })
         .await?;
     if !list.shares.iter().any(|share| share.id == first_id) {
-        return Err("created share is missing from list_shares".into());
+        bail!("created share is missing from list_shares");
     }
     println!("listed {} shares", list.shares.len());
 
-    let anonymous = Client::new(ClientConfig::new(&server));
-    let wrong = anonymous
+    let guest = anonymous(&settings);
+    let wrong = guest
         .get_share_with_options(
             &first_id,
             Some("wrongpass"),
@@ -71,9 +74,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .await?;
     if wrong.unlocked {
-        return Err("wrong password unexpectedly unlocked the share".into());
+        bail!("wrong password unexpectedly unlocked the share");
     }
-    let unlocked = anonymous
+    let unlocked = guest
         .get_share_with_options(
             &first_id,
             Some("firstpass"),
@@ -83,7 +86,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .await?;
     if !unlocked.unlocked {
-        return Err("correct password did not unlock the anonymous share".into());
+        bail!("correct password did not unlock the anonymous share");
     }
 
     let mut update = ShareCreateService::new(&folder_uri);
@@ -95,7 +98,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .get_share(&first_id, Some("secondpass"), false, false)
         .await?;
     if !updated.unlocked {
-        return Err("updated password did not unlock the share".into());
+        bail!("updated password did not unlock the share");
     }
     println!("updated share password/expiry");
 
@@ -115,22 +118,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .iter()
         .any(|share| share.id == first_id || share.id == second_id)
     {
-        return Err("deleted shares are still present".into());
+        bail!("deleted shares are still present");
     }
     println!("deleted shares; share CRUD passed");
     Ok(())
 }
 
-fn share_id_from_url(url: &str) -> Result<String, Box<dyn Error>> {
+fn share_id_from_url(url: &str) -> Result<String> {
     let path = url.split('?').next().unwrap_or(url).trim_end_matches('/');
     let segments = path.split('/').collect::<Vec<_>>();
     let index = segments
         .iter()
         .position(|segment| *segment == "s")
-        .ok_or("share URL has no /s/ segment")?;
+        .ok_or_else(|| anyhow!("share URL has no /s/ segment"))?;
     segments
         .get(index + 1)
         .filter(|id| !id.is_empty())
         .map(|id| (*id).to_owned())
-        .ok_or_else(|| "could not extract share id from URL".into())
+        .ok_or_else(|| anyhow!("could not extract share id from URL"))
 }

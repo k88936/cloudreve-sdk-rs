@@ -25,18 +25,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use cloudreve_sdk_api::api::{ExplorerApi, UserApi};
-use cloudreve_sdk_api::models::explorer::{FileURLService, UploadCredential};
-use cloudreve_sdk_api::models::user::LoginResponse;
-use cloudreve_sdk_api::{Client, ClientConfig};
+use cloudreve_sdk_api::models::explorer::UploadCredential;
 use cloudreve_sdk_uploader::{
-    ChunkProgress, Tracker, UploadError, UploadEvent, UploadParams, UploadSession, UploadSource,
-    UploadStream, Uploader, UploaderConfig,
+    ChunkProgress, Tracker, UploadEvent, UploadParams, UploadSession, UploadSource, UploadStream,
+    Uploader, UploaderConfig,
 };
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::io::AsyncRead;
+
+#[path = "example_utils/mod.rs"]
+mod example_utils;
+
+use example_utils::download::{digest, verify};
+use example_utils::drain::{Outcome, drain};
+use example_utils::env::Settings;
+use example_utils::login::login;
 
 // =========================================================================
 // The journal
@@ -144,26 +147,19 @@ impl Journal {
 // Driving a stream
 // =========================================================================
 
-/// How an upload ended.
-enum Outcome {
-    Completed,
-    Failed(UploadError),
-}
-
 /// Consume a stream, journaling every finished chunk, and report the outcome.
 ///
-/// This is the whole consumer: one loop feeds the journal and the progress
-/// tracker, because the tracker borrows the event instead of taking it.
-async fn drain(
+/// One loop feeds both the journal and the progress tracker, because the tracker
+/// borrows the event instead of taking it.
+async fn drain_journaled(
     stream: UploadStream,
     journal: &Journal,
     already_done: &[ChunkProgress],
 ) -> Result<Outcome> {
     let mut tracker = Tracker::new(&stream.session, already_done);
-    let mut events = stream.events;
 
-    while let Some(event) = events.next().await {
-        if let Some(update) = tracker.observe(&event) {
+    let outcome = drain(stream, |event| {
+        if let Some(update) = tracker.observe(event) {
             eprintln!(
                 "  {:>5.1}%  {}/{} chunks",
                 update.progress * 100.0,
@@ -172,41 +168,35 @@ async fn drain(
             );
         }
 
-        match event {
-            UploadEvent::ChunkDone(record) => journal.append(&record)?,
-            UploadEvent::Completed => {
-                journal.finish()?;
-                return Ok(Outcome::Completed);
-            }
-            UploadEvent::Failed(error) => return Ok(Outcome::Failed(error)),
+        if let UploadEvent::ChunkDone(record) = event {
+            journal.append(record)?;
         }
+        Ok(())
+    })
+    .await?;
+
+    if let Outcome::Completed = outcome {
+        journal.finish()?;
     }
 
-    bail!("upload stream ended without a terminal event")
+    Ok(outcome)
 }
 
 // =========================================================================
 // Settings and helpers
 // =========================================================================
 
-struct Settings {
-    server: String,
-    email: String,
-    password: String,
-    root: String,
+/// Resume-only knobs; the connection settings come from [`Settings`].
+struct ResumeSettings {
     name: String,
     dir: PathBuf,
     size_mb: usize,
     fail_delay: Duration,
 }
 
-impl Settings {
+impl ResumeSettings {
     fn from_env() -> Result<Self> {
         Ok(Self {
-            server: env::var("CLOUDREVE_SERVER")?,
-            email: env::var("CLOUDREVE_EMAIL")?,
-            password: env::var("CLOUDREVE_PASSWORD")?,
-            root: env::var("CLOUDREVE_URI").unwrap_or_else(|_| "cloudreve://my/".into()),
             name: env::var("CLOUDREVE_RESUME_NAME")
                 .unwrap_or_else(|_| "resume-e2e.bin".to_string()),
             dir: env::var("CLOUDREVE_RESUME_DIR")
@@ -224,23 +214,16 @@ impl Settings {
             ),
         })
     }
-
-    fn remote_uri(&self) -> String {
-        format!("{}/{}", self.root.trim_end_matches('/'), self.name)
-    }
 }
 
-async fn login(settings: &Settings) -> Result<Arc<Client>> {
-    let client = Arc::new(Client::new(ClientConfig::new(&settings.server)));
-    let LoginResponse { token, .. } = client.login(&settings.email, &settings.password).await?;
-    client.set_tokens_with_expiry(&token).await?;
-    Ok(client)
+fn remote_uri(root: &str, name: &str) -> String {
+    format!("{}/{}", root.trim_end_matches('/'), name)
 }
 
-fn params(source: &UploadSource, settings: &Settings) -> UploadParams {
+fn params(source: &UploadSource, remote_uri: &str) -> UploadParams {
     UploadParams {
         source: source.clone(),
-        remote_uri: settings.remote_uri(),
+        remote_uri: remote_uri.to_owned(),
         mime_type: Some("application/octet-stream".into()),
         last_modified: None,
         // The container starts empty; a repeat run must not create a version.
@@ -297,62 +280,6 @@ fn sabotaged_source(
     )
 }
 
-/// The download URL is built from Cloudreve's configured `SiteURL`, which is
-/// `http://localhost:5212` in the Podman harness while the published port is
-/// random. Rewrite only loopback hosts so the signature (path + query) is kept.
-fn retarget(raw: &str, server: &str) -> Result<reqwest::Url> {
-    let server = reqwest::Url::parse(server)?;
-    let mut url = reqwest::Url::parse(raw).or_else(|_| server.join(raw))?;
-    if matches!(url.host_str(), Some("localhost") | Some("127.0.0.1")) {
-        url.set_scheme(server.scheme())
-            .map_err(|_| anyhow!("invalid server scheme"))?;
-        url.set_host(server.host_str())
-            .map_err(|_| anyhow!("invalid server host"))?;
-        url.set_port(server.port())
-            .map_err(|_| anyhow!("invalid server port"))?;
-    }
-    Ok(url)
-}
-
-async fn verify_download(client: &Client, server: &str, uri: &str, expected: &[u8]) -> Result<()> {
-    let response = client
-        .get_file_url(&FileURLService {
-            uris: vec![uri.to_string()],
-            download: Some(true),
-            redirect: Some(false),
-            no_cache: Some(true),
-            ..Default::default()
-        })
-        .await?;
-    let raw = response
-        .urls
-        .first()
-        .context("no download URL returned")?
-        .url
-        .clone();
-    let url = retarget(&raw, server)?;
-
-    let response = reqwest::Client::new()
-        .get(url.clone())
-        .send()
-        .await
-        .context("download request failed")?;
-    if !response.status().is_success() {
-        bail!("download failed with {} for {url}", response.status());
-    }
-    let bytes = response.bytes().await?;
-
-    let expected_hash: [u8; 32] = Sha256::digest(expected).into();
-    let actual_hash: [u8; 32] = Sha256::digest(&bytes).into();
-    if actual_hash != expected_hash {
-        bail!(
-            "downloaded content hash mismatch ({} bytes); resume produced different data",
-            bytes.len()
-        );
-    }
-    Ok(())
-}
-
 // =========================================================================
 // Main
 // =========================================================================
@@ -360,19 +287,22 @@ async fn verify_download(client: &Client, server: &str, uri: &str, expected: &[u
 #[tokio::main]
 async fn main() -> Result<()> {
     let settings = Settings::from_env()?;
-    let client = login(&settings).await?;
+    let resume = ResumeSettings::from_env()?;
+    let (client, _) = login(&settings, "cloudreve-sdk-uploader-example").await?;
+    let client = Arc::new(client);
+    let remote_uri = remote_uri(&settings.root, &resume.name);
 
-    let data = Arc::new(vec![0x5a; settings.size_mb * 1024 * 1024]);
+    let data = Arc::new(vec![0x5a; resume.size_mb * 1024 * 1024]);
     let phase = Arc::new(AtomicU8::new(0));
     let opened: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let source = sabotaged_source(
         Arc::clone(&data),
         Arc::clone(&phase),
         Arc::clone(&opened),
-        settings.fail_delay,
+        resume.fail_delay,
     );
 
-    std::fs::create_dir_all(&settings.dir)?;
+    std::fs::create_dir_all(&resume.dir)?;
     let uploader = Uploader::new(
         Arc::clone(&client),
         UploaderConfig {
@@ -382,11 +312,11 @@ async fn main() -> Result<()> {
     );
 
     // --- 1. an upload that gets interrupted ------------------------------
-    let stream = uploader.upload(params(&source, &settings)).await?;
-    let journal = Journal::new(&settings.dir, stream.session.session_id());
+    let stream = uploader.upload(params(&source, &remote_uri)).await?;
+    let journal = Journal::new(&resume.dir, stream.session.session_id());
     journal.create(&stream.session)?;
 
-    let Outcome::Failed(error) = drain(stream, &journal, &[]).await? else {
+    let Outcome::Failed(error) = drain_journaled(stream, &journal, &[]).await? else {
         bail!("the first attempt unexpectedly succeeded; increase CLOUDREVE_RESUME_MB");
     };
     println!("interrupted as intended: {error}");
@@ -410,7 +340,7 @@ async fn main() -> Result<()> {
     let stream = uploader
         .try_resume(session, source.clone(), records.clone())
         .await?;
-    match drain(stream, &journal, &records).await? {
+    match drain_journaled(stream, &journal, &records).await? {
         Outcome::Completed => {}
         Outcome::Failed(error) => bail!("resume failed: {error}"),
     }
@@ -419,10 +349,10 @@ async fn main() -> Result<()> {
     if journal.path().exists() {
         bail!("{} survived a completed upload", journal.path().display());
     }
-    if std::fs::read_dir(&settings.dir)?.next().is_some() {
+    if std::fs::read_dir(&resume.dir)?.next().is_some() {
         bail!(
             "{} is not empty after a completed upload",
-            settings.dir.display()
+            resume.dir.display()
         );
     }
     {
@@ -434,7 +364,7 @@ async fn main() -> Result<()> {
     }
 
     // --- 5. the uploaded bytes are the source bytes ----------------------
-    verify_download(&client, &settings.server, &settings.remote_uri(), &data).await?;
+    verify(&client, &settings.server, &remote_uri, digest(&data)).await?;
     println!("downloaded content hash matches; interrupted upload resumed and completed");
 
     Ok(())
