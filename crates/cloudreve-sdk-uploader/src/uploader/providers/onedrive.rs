@@ -58,7 +58,7 @@ where
     S: Stream<Item = Result<Bytes, io::Error>> + Send + Sync + Unpin + 'static,
 {
     // OneDrive doesn't support empty files
-    if session.file_size == 0 {
+    if session.file_size() == 0 {
         bail!("OneDrive does not support empty file uploads");
     }
 
@@ -67,7 +67,7 @@ where
     // Calculate byte range
     let range_start = chunk.offset;
     let range_end = chunk.offset + chunk.size - 1;
-    let content_range = format!("bytes {}-{}/{}", range_start, range_end, session.file_size);
+    let content_range = format!("bytes {}-{}/{}", range_start, range_end, session.file_size());
 
     debug!(
         target: "uploader::onedrive",

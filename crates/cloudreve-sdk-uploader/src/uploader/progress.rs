@@ -109,7 +109,7 @@ impl Tracker {
         }
 
         Self {
-            total_size: session.file_size,
+            total_size: session.file_size(),
             total_chunks,
             uploaded: known.values().sum(),
             completed_chunks: known.len(),
@@ -179,8 +179,6 @@ mod tests {
 
     fn session(num_chunks: usize) -> UploadSession {
         UploadSession::new(
-            "file:/a".into(),
-            "cloudreve://my/a.bin".into(),
             num_chunks as u64 * 5,
             UploadCredential {
                 session_id: "session-1".into(),

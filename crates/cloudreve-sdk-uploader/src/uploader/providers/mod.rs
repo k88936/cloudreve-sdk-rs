@@ -154,11 +154,7 @@ pub async fn complete_upload(
     session: &UploadSession,
     completed: &[ChunkProgress],
 ) -> Result<()> {
-    let policy_type = if session.is_relay() {
-        PolicyType::Local
-    } else {
-        session.policy_type()
-    };
+    let policy_type = session.effective_policy_type();
 
     match policy_type {
         PolicyType::Local | PolicyType::Remote => {

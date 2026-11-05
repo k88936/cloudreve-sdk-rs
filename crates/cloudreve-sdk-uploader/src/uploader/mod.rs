@@ -159,7 +159,7 @@ impl Uploader {
             warn!(
                 target: "uploader",
                 session_id = %session.session_id(),
-                expires_at = session.expires_at,
+                expires_at = session.expires_at(),
                 "Refusing to resume an expired upload session"
             );
             return Err(UploadError::SessionExpired.into());
@@ -170,7 +170,7 @@ impl Uploader {
             target: "uploader",
             session_id = %session.session_id(),
             source = %source.display(),
-            file_size = session.file_size,
+            file_size = session.file_size(),
             completed_chunks = completed.len(),
             total_chunks = session.num_chunks(),
             "Resuming upload"
@@ -179,11 +179,11 @@ impl Uploader {
         // Nothing compares content, so this is the only hint that the caller is
         // resuming with the wrong file. It is a warning, not an error: only the
         // caller knows whether the difference is expected.
-        if source.size() != session.file_size {
+        if source.size() != session.file_size() {
             warn!(
                 target: "uploader",
                 session_id = %session.session_id(),
-                session_size = session.file_size,
+                session_size = session.file_size(),
                 source_size = source.size(),
                 "Resuming with a source of a different size: the provider will \
                  assemble a file from chunks of different files"
@@ -202,16 +202,11 @@ impl Uploader {
         resumed: bool,
     ) -> Result<UploadStream> {
         let encryption = session
-            .encrypt_metadata
-            .as_ref()
+            .encrypt_metadata()
             .map(EncryptionConfig::from_metadata)
             .transpose()?;
 
-        let policy_type = if session.is_relay() {
-            providers::PolicyType::Local
-        } else {
-            session.policy_type()
-        };
+        let policy_type = session.effective_policy_type();
 
         // Shared by both callbacks: the starter uploads chunks, the finalizer
         // tells the provider the multipart upload is complete.
@@ -263,7 +258,7 @@ impl Uploader {
                     debug!(
                         target: "uploader",
                         session_id = %session.session_id(),
-                        policy_type = ?session.policy_type(),
+                        policy_type = ?session.effective_policy_type(),
                         chunks = completed.len(),
                         "Completing upload"
                     );
@@ -309,12 +304,7 @@ impl Uploader {
             "Upload session created"
         );
 
-        Ok(UploadSession::new(
-            params.source.identifier().to_string(),
-            params.remote_uri.clone(),
-            params.source.size(),
-            credential,
-        ))
+        Ok(UploadSession::new(params.source.size(), credential))
     }
 }
 
@@ -353,15 +343,18 @@ mod tests {
 
     /// A session with `num_chunks` chunks of 5 bytes, reachable without a server.
     fn session(num_chunks: usize) -> UploadSession {
+        session_expiring_at(num_chunks, 4_000_000_000)
+    }
+
+    /// The same, expiring at `expires` (Unix seconds).
+    fn session_expiring_at(num_chunks: usize, expires: i64) -> UploadSession {
         use cloudreve_api::models::explorer::UploadCredential;
 
         UploadSession::new(
-            "file:/a".into(),
-            "cloudreve://my/a.bin".into(),
             num_chunks as u64 * 5,
             UploadCredential {
                 session_id: "session-1".into(),
-                expires: 4_000_000_000,
+                expires,
                 chunk_size: 5,
                 ..Default::default()
             },
@@ -374,8 +367,7 @@ mod tests {
             Arc::new(CrClient::new(ClientConfig::new("http://127.0.0.1:1"))),
             UploaderConfig::default(),
         );
-        let mut expired = session(2);
-        expired.expires_at = 1;
+        let expired = session_expiring_at(2, 1);
 
         let error = uploader
             .try_resume(expired, UploadSource::from_bytes(vec![0u8; 10]), Vec::new())

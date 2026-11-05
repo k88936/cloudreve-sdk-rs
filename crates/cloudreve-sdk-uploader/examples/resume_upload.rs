@@ -25,7 +25,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use cloudreve_sdk_api::models::explorer::UploadCredential;
 use cloudreve_sdk_uploader::{
     ChunkProgress, Tracker, UploadEvent, UploadParams, UploadSession, UploadSource, UploadStream,
     Uploader, UploaderConfig,
@@ -47,15 +46,15 @@ use example_utils::login::login;
 
 /// Line 1 of the journal: the *cold* half of the session.
 ///
-/// Chunk geometry, policy, relay flag and expiry are recomputed by
-/// `UploadSession::new`, so they are not stored. There is no version field: a
+/// The session is stored as-is: the credential carries everything the resume
+/// needs. The source id is the caller's own bookkeeping, so it rides along and
+/// is checked when the journal is read back. There is no version field: a
 /// journal that fails to parse is simply discarded and the upload starts over.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredSession {
-    remote_uri: String,
     source_id: String,
-    file_size: u64,
-    credential: UploadCredential,
+    #[serde(flatten)]
+    session: UploadSession,
 }
 
 /// Append-only journal of one upload session.
@@ -78,12 +77,10 @@ impl Journal {
     }
 
     /// Write the session. Called once, before the first chunk is polled.
-    fn create(&self, session: &UploadSession) -> Result<()> {
+    fn create(&self, session: &UploadSession, source_id: &str) -> Result<()> {
         let stored = StoredSession {
-            remote_uri: session.remote_uri.clone(),
-            source_id: session.source_id.clone(),
-            file_size: session.file_size,
-            credential: session.credential().clone(),
+            source_id: source_id.to_owned(),
+            session: session.clone(),
         };
 
         let mut file = File::create(&self.path)
@@ -104,7 +101,7 @@ impl Journal {
     }
 
     /// Read the session and every completion record back.
-    fn load(&self) -> Result<(UploadSession, Vec<ChunkProgress>)> {
+    fn load(&self, source_id: &str) -> Result<(UploadSession, Vec<ChunkProgress>)> {
         let reader = BufReader::new(
             File::open(&self.path).with_context(|| format!("opening {}", self.path.display()))?,
         );
@@ -114,12 +111,14 @@ impl Journal {
             .next()
             .with_context(|| format!("{} is empty", self.path.display()))??;
         let stored: StoredSession = serde_json::from_str(&first)?;
-        let session = UploadSession::new(
-            stored.source_id,
-            stored.remote_uri,
-            stored.file_size,
-            stored.credential,
-        );
+        if stored.source_id != source_id {
+            bail!(
+                "{} belongs to source {}, not {source_id}",
+                self.path.display(),
+                stored.source_id
+            );
+        }
+        let session = stored.session;
 
         let mut records = Vec::new();
         for line in lines {
@@ -314,7 +313,7 @@ async fn main() -> Result<()> {
     // --- 1. an upload that gets interrupted ------------------------------
     let stream = uploader.upload(params(&source, &remote_uri)).await?;
     let journal = Journal::new(&resume.dir, stream.session.session_id());
-    journal.create(&stream.session)?;
+    journal.create(&stream.session, source.identifier())?;
 
     let Outcome::Failed(error) = drain_journaled(stream, &journal, &[]).await? else {
         bail!("the first attempt unexpectedly succeeded; increase CLOUDREVE_RESUME_MB");
@@ -322,7 +321,7 @@ async fn main() -> Result<()> {
     println!("interrupted as intended: {error}");
 
     // --- 2. what the journal knows --------------------------------------
-    let (session, records) = journal.load()?;
+    let (session, records) = journal.load(source.identifier())?;
     if records.is_empty() {
         bail!("the journal kept no chunk records; increase CLOUDREVE_RESUME_FAIL_DELAY_MS");
     }

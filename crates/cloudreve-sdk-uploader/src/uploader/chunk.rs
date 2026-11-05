@@ -272,8 +272,6 @@ mod tests {
 
     fn session(file_size: u64, chunk_size: i64) -> UploadSession {
         UploadSession::new(
-            "file:/a".into(),
-            "cloudreve://my/a.bin".into(),
             file_size,
             UploadCredential {
                 session_id: "session-1".into(),
