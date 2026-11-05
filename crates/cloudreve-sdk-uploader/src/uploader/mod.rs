@@ -316,24 +316,6 @@ impl Uploader {
             credential,
         ))
     }
-
-    /// Delete the remote upload session (cancel on server side)
-    #[allow(dead_code)]
-    async fn delete_remote_session(&self, session: &UploadSession) -> UploadResult<()> {
-        use cloudreve_api::models::explorer::DeleteUploadSessionService;
-
-        let request = DeleteUploadSessionService {
-            id: session.session_id().to_string(),
-            uri: session.remote_uri.clone(),
-        };
-
-        self.cr_client
-            .delete_upload_session(&request)
-            .await
-            .map_err(|e| UploadError::SessionDeletionFailed(e.to_string()))?;
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
