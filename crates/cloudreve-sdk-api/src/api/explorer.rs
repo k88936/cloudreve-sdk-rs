@@ -589,7 +589,7 @@ impl ExplorerApi for Client {
             .send()
             .await?;
 
-        let api_response: crate::error::ApiResponse<UploadCredential> = response.json().await?;
+        let api_response: crate::error::ApiResponse<()> = response.json().await?;
 
         if api_response.code != 0 {
             return Err(crate::error::ApiError::from_response(api_response));
