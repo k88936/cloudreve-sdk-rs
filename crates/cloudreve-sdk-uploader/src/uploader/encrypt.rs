@@ -4,7 +4,7 @@ use crate::uploader::error::{UploadError, UploadResult};
 use aes::Aes256;
 use aes::cipher::{KeyIvInit, StreamCipher};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use cloudreve_api::models::explorer::EncryptMetadata;
+use cloudreve_api::models::explorer::{EncryptMetadata, EncryptionCipher};
 use ctr::Ctr128BE;
 
 type Aes256Ctr = Ctr128BE<Aes256>;
@@ -21,6 +21,12 @@ pub struct EncryptionConfig {
 impl EncryptionConfig {
     /// Create encryption config from Cloudreve's encrypt metadata
     pub fn from_metadata(metadata: &EncryptMetadata) -> UploadResult<Self> {
+        // Exhaustive on purpose: a cipher this crate does not implement must not
+        // be silently encrypted as AES-256-CTR, so a new variant breaks the build.
+        match metadata.algorithm {
+            EncryptionCipher::Aes256Ctr => {}
+        }
+
         let key_bytes = BASE64
             .decode(&metadata.key_plain_text)
             .map_err(|e| UploadError::EncryptionError(format!("Invalid key: {}", e)))?;
