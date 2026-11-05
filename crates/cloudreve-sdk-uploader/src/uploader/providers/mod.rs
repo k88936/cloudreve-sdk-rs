@@ -58,7 +58,6 @@ impl PolicyType {
             ApiPolicyType::S3 => PolicyType::S3,
             ApiPolicyType::Ks3 => PolicyType::Ks3,
             ApiPolicyType::Obs => PolicyType::Obs,
-            ApiPolicyType::LoadBalance => PolicyType::Local, // Fallback
         }
     }
 
