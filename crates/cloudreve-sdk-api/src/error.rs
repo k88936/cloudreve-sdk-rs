@@ -127,7 +127,11 @@ pub enum ApiError {
 
     /// HTTP request error
     #[error("HTTP request error: {0}")]
-    RequestError(#[from] reqwest::Error),
+    RequestError(reqwest::Error),
+
+    /// The request ran out of its budget before the answer was complete
+    #[error("Request timed out: {0}")]
+    Timeout(String),
 
     /// JSON serialization/deserialization error
     #[error("JSON error: {0}")]
@@ -156,6 +160,19 @@ pub enum ApiError {
     /// Generic error
     #[error("{0}")]
     Other(String),
+}
+
+impl From<reqwest::Error> for ApiError {
+    /// A request that ran out of time is its own answer: the server took the
+    /// connection and then said nothing, which a caller reads differently from
+    /// a network that dropped it.
+    fn from(error: reqwest::Error) -> Self {
+        if error.is_timeout() {
+            ApiError::Timeout(error.to_string())
+        } else {
+            ApiError::RequestError(error)
+        }
+    }
 }
 
 impl ApiError {

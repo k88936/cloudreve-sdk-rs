@@ -17,7 +17,8 @@ pub const CR_HEADER_PREFIX: &str = "X-Cr-";
 pub struct ClientConfig {
     /// Base URL of the Cloudreve instance (e.g., "https://example.com")
     pub base_url: String,
-    /// Timeout for requests in seconds
+    /// How long one request may take, in seconds: connecting, and waiting for
+    /// the whole answer, body included.
     pub timeout_seconds: u64,
     /// Client ID
     pub client_id: String,
@@ -36,7 +37,7 @@ impl ClientConfig {
         }
     }
 
-    /// Set the request timeout
+    /// Set that budget
     pub fn with_timeout(mut self, timeout_seconds: u64) -> Self {
         self.timeout_seconds = timeout_seconds;
         self
@@ -178,6 +179,15 @@ impl Client {
         }
     }
 
+    /// How long one JSON request has, from the first byte out to the last byte
+    /// in: [`ClientConfig::timeout_seconds`].
+    ///
+    /// Chunk uploads and the event stream do not take it: their body is the work
+    /// itself, not an answer to wait for.
+    fn request_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.config.timeout_seconds)
+    }
+
     /// Set a callback to be invoked when credentials are refreshed
     ///
     /// The callback receives the new token information and can perform async operations
@@ -312,7 +322,13 @@ impl Client {
         let url = self.build_url("/session/token/refresh");
         let request = RefreshTokenRequest { refresh_token };
 
-        let response = self.http_client.post(&url).json(&request).send().await?;
+        let response = self
+            .http_client
+            .post(&url)
+            .timeout(self.request_timeout())
+            .json(&request)
+            .send()
+            .await?;
 
         let api_response: ApiResponse<Token> = response.json().await?;
 
@@ -358,7 +374,10 @@ impl Client {
         R: DeserializeOwned + Default,
     {
         let url = self.build_url(path);
-        let mut request = self.http_client.request(method, &url);
+        let mut request = self
+            .http_client
+            .request(method, &url)
+            .timeout(self.request_timeout());
 
         // Add authentication header if needed
         if !options.no_credential {
